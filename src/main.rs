@@ -1,10 +1,13 @@
+use io_uring::{IoUring, SubmissionQueue, opcode, squeue, types};
+use slab::Slab;
+use std::cmp::min;
 use std::collections::VecDeque;
 use std::net::TcpListener;
 use std::os::unix::io::{AsRawFd, RawFd};
 use std::{io, ptr};
 
-use io_uring::{IoUring, SubmissionQueue, opcode, squeue, types};
-use slab::Slab;
+const RW_BUF_SIZE: usize = 2048;
+const MAX_CLIENT_HEADERS: usize = 32;
 
 #[derive(Clone, Debug)]
 enum Token {
@@ -15,6 +18,7 @@ enum Token {
     Read {
         fd: RawFd,
         buf_index: usize,
+        filled: usize,
     },
     Write {
         fd: RawFd,
@@ -136,18 +140,23 @@ fn main() -> anyhow::Result<()> {
                     let (buf_index, buf) = match bufpool.pop() {
                         Some(buf_index) => (buf_index, &mut buf_alloc[buf_index]),
                         None => {
-                            let buf = vec![0u8; 2048].into_boxed_slice();
+                            let buf = vec![0u8; RW_BUF_SIZE].into_boxed_slice();
                             let buf_entry = buf_alloc.vacant_entry();
                             let buf_index = buf_entry.key();
                             (buf_index, buf_entry.insert(buf))
                         }
                     };
 
-                    *token = Token::Read { fd, buf_index };
+                    *token = Token::Read {
+                        fd,
+                        buf_index,
+                        filled: 0,
+                    };
 
-                    let read_e = opcode::Recv::new(types::Fd(fd), buf.as_mut_ptr(), buf.len() as _)
-                        .build()
-                        .user_data(token_index as _);
+                    let read_e =
+                        opcode::Recv::new(types::Fd(fd), buf.as_mut_ptr(), RW_BUF_SIZE as _)
+                            .build()
+                            .user_data(token_index as _);
 
                     unsafe {
                         if sq.push(&read_e).is_err() {
@@ -155,7 +164,11 @@ fn main() -> anyhow::Result<()> {
                         }
                     }
                 }
-                Token::Read { fd, buf_index } => {
+                Token::Read {
+                    fd,
+                    buf_index,
+                    filled,
+                } => {
                     if ret == 0 {
                         bufpool.push(buf_index);
                         token_alloc.remove(token_index);
@@ -166,23 +179,76 @@ fn main() -> anyhow::Result<()> {
                             libc::close(fd);
                         }
                     } else {
-                        let len = ret as usize;
-                        let buf = &buf_alloc[buf_index];
+                        let filled = filled + ret as usize;
 
-                        *token = Token::Write {
-                            fd,
-                            buf_index,
-                            len,
-                            offset: 0,
-                        };
+                        let mut headers = [httparse::EMPTY_HEADER; MAX_CLIENT_HEADERS];
+                        let mut req = httparse::Request::new(&mut headers);
+                        let mut response: Option<&[u8]> = None;
 
-                        let write_e = opcode::Send::new(types::Fd(fd), buf.as_ptr(), len as _)
-                            .build()
-                            .user_data(token_index as _);
+                        match req.parse(&buf_alloc[buf_index][..filled]) {
+                            Ok(httparse::Status::Complete(_)) => {
+                                if let Some(method) = req.method
+                                    && method.eq_ignore_ascii_case("get")
+                                {
+                                    response = Some(b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nConnection: close\r\n\r\nOK\r\n");
+                                } else {
+                                    response = Some(b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+                                }
+                            }
+                            Ok(httparse::Status::Partial) => {
+                                if filled >= RW_BUF_SIZE {
+                                    // Buffer exhausted with incomplete request — reject.
+                                    response = Some(b"HTTP/1.1 413 Content Too Large\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+                                } else {
+                                    // Issue another recv into the remaining buffer space.
 
-                        unsafe {
-                            if sq.push(&write_e).is_err() {
-                                backlog.push_back(write_e);
+                                    let buf = &mut buf_alloc[buf_index];
+                                    let next_ptr = unsafe { buf.as_mut_ptr().add(filled) };
+                                    let remaining = RW_BUF_SIZE - filled;
+
+                                    *token = Token::Read {
+                                        fd,
+                                        buf_index,
+                                        filled,
+                                    };
+
+                                    let read_e =
+                                        opcode::Recv::new(types::Fd(fd), next_ptr, remaining as _)
+                                            .build()
+                                            .user_data(token_index as _);
+
+                                    unsafe {
+                                        if sq.push(&read_e).is_err() {
+                                            backlog.push_back(read_e);
+                                        }
+                                    }
+                                }
+                            }
+                            Err(_) => {
+                                response = Some(b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+                            }
+                        }
+
+                        if let Some(response) = response {
+                            let buf = &mut buf_alloc[buf_index];
+                            let len = min(response.len(), RW_BUF_SIZE); // truncate response if buffer size exceeded
+                            buf[..len].copy_from_slice(&response[..len]);
+
+                            *token = Token::Write {
+                                fd,
+                                buf_index,
+                                offset: 0,
+                                len,
+                            };
+
+                            let write_e = opcode::Send::new(types::Fd(fd), buf.as_ptr(), len as _)
+                                .build()
+                                .user_data(token_index as _);
+
+                            unsafe {
+                                if sq.push(&write_e).is_err() {
+                                    backlog.push_back(write_e);
+                                }
                             }
                         }
                     }
@@ -195,15 +261,18 @@ fn main() -> anyhow::Result<()> {
                 } => {
                     let write_len = ret as usize;
 
-                    let entry = if offset + write_len >= len {
+                    if offset + write_len >= len {
+                        // Response fully sent — close the connection.
                         bufpool.push(buf_index);
+                        token_alloc.remove(token_index);
 
-                        *token = Token::Poll { fd };
+                        println!("close");
 
-                        opcode::PollAdd::new(types::Fd(fd), libc::POLLIN as _)
-                            .build()
-                            .user_data(token_index as _)
+                        unsafe {
+                            libc::close(fd);
+                        }
                     } else {
+                        // Partial write — send the remainder.
                         let offset = offset + write_len;
                         let len = len - offset;
 
@@ -216,14 +285,14 @@ fn main() -> anyhow::Result<()> {
                             len,
                         };
 
-                        opcode::Write::new(types::Fd(fd), buf.as_ptr(), len as _)
+                        let entry = opcode::Write::new(types::Fd(fd), buf.as_ptr(), len as _)
                             .build()
-                            .user_data(token_index as _)
-                    };
+                            .user_data(token_index as _);
 
-                    unsafe {
-                        if sq.push(&entry).is_err() {
-                            backlog.push_back(entry);
+                        unsafe {
+                            if sq.push(&entry).is_err() {
+                                backlog.push_back(entry);
+                            }
                         }
                     }
                 }
