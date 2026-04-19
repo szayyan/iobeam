@@ -3,9 +3,11 @@ use io_uring::{IoUring, SubmissionQueue, cqueue, opcode, squeue, types};
 use slab::Slab;
 use std::cmp::min;
 use std::collections::VecDeque;
+use std::fs::File;
 use std::io;
 use std::net::TcpListener;
-use std::os::unix::io::{AsRawFd, RawFd};
+use std::os::unix::fs::MetadataExt;
+use std::os::unix::io::{AsRawFd, IntoRawFd, RawFd};
 
 const RW_BUF_SIZE: usize = 2048;
 const MAX_CLIENT_HEADERS: usize = 32;
@@ -26,6 +28,7 @@ enum Token {
         buf_index: usize,
         offset: usize,
         len: usize,
+        file_fd: Option<(RawFd, usize)>,
     },
     Close,
 }
@@ -150,13 +153,13 @@ fn main() -> anyhow::Result<()> {
 
                     // If the multishot accept has ended, resubmit it.
                     if !cqueue::more(flags) {
-                        let accept_e = opcode::AcceptMulti::new(types::Fd(listener.as_raw_fd()))
-                            .build()
-                            .user_data(token_index as _);
                         unsafe {
-                            if sq.push(&accept_e).is_err() {
-                                backlog.push_back(accept_e);
-                            }
+                            queue_multishot_accept(
+                                listener_fd,
+                                token_index as _,
+                                &mut sq,
+                                &mut backlog,
+                            );
                         }
                     }
                 }
@@ -215,13 +218,36 @@ fn main() -> anyhow::Result<()> {
                         let mut headers = [httparse::EMPTY_HEADER; MAX_CLIENT_HEADERS];
                         let mut req = httparse::Request::new(&mut headers);
                         let mut response: Option<&[u8]> = None;
+                        let mut response_file: Option<(RawFd, usize)> = None;
 
                         match req.parse(&buf_alloc[buf_index][..filled]) {
                             Ok(httparse::Status::Complete(_)) => {
                                 if let Some(method) = req.method
                                     && method.eq_ignore_ascii_case("get")
                                 {
-                                    response = Some(b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nConnection: close\r\n\r\nOK\r\n");
+                                    match File::open("./public/index.html") {
+                                        Ok(file) => {
+                                            match file.metadata() {
+                                                Ok(metadata) => {
+                                                    let file_size = metadata.size() as usize;
+                                                    let ffd = file.into_raw_fd(); // transfer ownership; fd won't be closed on drop
+                                                    eprintln!(
+                                                        "open ok: ffd={ffd} size={file_size}"
+                                                    );
+                                                    response = Some(b"HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nConnection: close\r\n\r\n");
+                                                    response_file = Some((ffd, file_size));
+                                                }
+                                                Err(e) => {
+                                                    eprintln!("fstat error: {e}");
+                                                    response = Some(b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+                                                }
+                                            }
+                                        }
+                                        Err(e) => {
+                                            eprintln!("open error: {e}");
+                                            response = Some(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+                                        }
+                                    }
                                 } else {
                                     response = Some(b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
                                 }
@@ -270,6 +296,7 @@ fn main() -> anyhow::Result<()> {
                                 buf_index,
                                 offset: 0,
                                 len,
+                                file_fd: response_file,
                             };
 
                             let write_e = opcode::Send::new(types::Fd(fd), buf.as_ptr(), len as _)
@@ -289,12 +316,33 @@ fn main() -> anyhow::Result<()> {
                     buf_index,
                     offset,
                     len,
+                    file_fd,
                 } => {
                     let write_len = ret as usize;
 
                     if offset + write_len >= len {
-                        // Response fully sent — close the connection.
+                        // Headers fully sent — send file body via sendfile if present, then close.
                         bufpool.push(buf_index);
+
+                        if let Some((ffd, file_size)) = file_fd {
+                            eprintln!("sendfile: fd={fd} ffd={ffd} size={file_size}");
+                            let mut off: libc::off_t = 0;
+                            let mut remaining = file_size;
+                            while remaining > 0 {
+                                let n = unsafe { libc::sendfile(fd, ffd, &mut off, remaining) };
+                                eprintln!(
+                                    "sendfile ret={n} remaining={remaining} errno={}",
+                                    unsafe { *libc::__errno_location() }
+                                );
+                                if n <= 0 {
+                                    break;
+                                }
+                                remaining -= n as usize;
+                            }
+                            unsafe {
+                                libc::close(ffd);
+                            }
+                        }
 
                         println!("close");
 
@@ -321,6 +369,7 @@ fn main() -> anyhow::Result<()> {
                             buf_index,
                             offset,
                             len,
+                            file_fd,
                         };
 
                         let entry = opcode::Write::new(types::Fd(fd), buf.as_ptr(), len as _)
