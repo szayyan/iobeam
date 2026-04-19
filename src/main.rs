@@ -27,6 +27,7 @@ enum Token {
         offset: usize,
         len: usize,
     },
+    Close,
 }
 
 unsafe fn queue_multishot_accept(
@@ -108,15 +109,23 @@ fn main() -> anyhow::Result<()> {
                     io::Error::from_raw_os_error(-ret)
                 );
 
-                if matches!(token, Some(Token::Accept)) {
-                    unsafe {
+                match token {
+                    Some(Token::Accept) => unsafe {
                         queue_multishot_accept(
                             listener_fd,
                             token_index as _,
                             &mut sq,
                             &mut backlog,
                         );
+                    },
+                    Some(Token::Close) => {
+                        // close has failed with either
+                        // - EBADF — fd is not valid (double-close)
+                        // - EINTR — interrupted by a signal
+                        // in both cases the fd is already closed so remove from token_alloc and continue
+                        token_alloc.remove(token_index);
                     }
+                    _ => {}
                 }
                 continue;
             }
@@ -186,12 +195,19 @@ fn main() -> anyhow::Result<()> {
                 } => {
                     if ret == 0 {
                         bufpool.push(buf_index);
-                        token_alloc.remove(token_index);
 
                         println!("shutdown");
 
+                        *token = Token::Close;
+
+                        let close_e = opcode::Close::new(types::Fd(fd))
+                            .build()
+                            .user_data(token_index as _);
+
                         unsafe {
-                            libc::close(fd);
+                            if sq.push(&close_e).is_err() {
+                                backlog.push_back(close_e);
+                            }
                         }
                     } else {
                         let filled = filled + ret as usize;
@@ -279,12 +295,19 @@ fn main() -> anyhow::Result<()> {
                     if offset + write_len >= len {
                         // Response fully sent — close the connection.
                         bufpool.push(buf_index);
-                        token_alloc.remove(token_index);
 
                         println!("close");
 
+                        *token = Token::Close;
+
+                        let close_e = opcode::Close::new(types::Fd(fd))
+                            .build()
+                            .user_data(token_index as _);
+
                         unsafe {
-                            libc::close(fd);
+                            if sq.push(&close_e).is_err() {
+                                backlog.push_back(close_e);
+                            }
                         }
                     } else {
                         // Partial write — send the remainder.
@@ -310,6 +333,9 @@ fn main() -> anyhow::Result<()> {
                             }
                         }
                     }
+                }
+                Token::Close { .. } => {
+                    token_alloc.remove(token_index);
                 }
             }
         }
