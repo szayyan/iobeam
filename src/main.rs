@@ -9,6 +9,8 @@ use std::net::TcpListener;
 use std::os::unix::fs::MetadataExt;
 use std::os::unix::io::{AsRawFd, IntoRawFd, RawFd};
 
+mod uring_server;
+
 const RW_BUF_SIZE: usize = 2048;
 const MAX_CLIENT_HEADERS: usize = 32;
 
