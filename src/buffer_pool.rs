@@ -1,6 +1,6 @@
 use slab::Slab;
 
-pub const BUFFER_SIZE: usize = 2048;
+pub const BUFFER_POOL_ITEM_SIZE: usize = 2048;
 
 pub struct BufferPool {
     pool: Vec<usize>,
@@ -30,7 +30,7 @@ impl BufferPool {
         match self.pool.pop() {
             Some(index) => (index, &mut self.alloc[index]),
             None => {
-                let buf = vec![0u8; BUFFER_SIZE].into_boxed_slice();
+                let buf = vec![0u8; BUFFER_POOL_ITEM_SIZE].into_boxed_slice();
                 let entry = self.alloc.vacant_entry();
                 let index = entry.key();
                 (index, entry.insert(buf))

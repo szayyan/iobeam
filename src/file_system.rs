@@ -6,7 +6,7 @@ use std::{
     },
 };
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Copy)]
 pub struct FileResult {
     pub fd: RawFd,
     pub size: usize,
