@@ -34,8 +34,24 @@ pub fn write_static_content_too_large_error(buf: &mut HttpHeaderBuffer) {
     );
 }
 
-pub fn write_static_ok_response(buf: &mut HttpHeaderBuffer) {
-    write_static_response_header(buf, b"HTTP/1.1 200 OK\r\nContent-Type: text/html\r\n\r\n");
+pub fn write_dynamic_ok_response(buf: &mut HttpHeaderBuffer, path: &str, content_length: usize) {
+    // doesn't cover edge cases like Path::new(..).extension() does
+    // but good enough for our usecase and more performant
+    let content_type = path
+        .rfind('.')
+        .map(|s| mime_guess::from_ext(&path[s + 1..]).first_raw())
+        .flatten()
+        .unwrap_or("application/octet-stream");
+
+    let mut cl_buf = itoa::Buffer::new();
+    let cl_str = cl_buf.format(content_length);
+
+    buf.try_extend_from_slice(b"HTTP/1.1 200 OK\r\nContent-Type: ")
+        .unwrap();
+    buf.try_extend_from_slice(content_type.as_bytes()).unwrap();
+    buf.try_extend_from_slice(b"\r\nContent-Length: ").unwrap();
+    buf.try_extend_from_slice(cl_str.as_bytes()).unwrap();
+    buf.try_extend_from_slice(b"\r\n\r\n").unwrap();
 }
 
 pub fn is_get_request(request: &httparse::Request) -> bool {

@@ -10,12 +10,13 @@ use std::{
 };
 
 use crate::{
-    buffer_pool::{self, BUFFER_POOL_ITEM_SIZE, BufferPool},
+    buffer_pool::{BUFFER_POOL_ITEM_SIZE, BufferPool},
     file_system::{FileResult, FileSystemHandler},
     http::{
-        HttpHeaderBuffer, is_get_request, write_static_bad_request_error,
-        write_static_content_not_found_error, write_static_content_too_large_error,
-        write_static_internal_server_error, write_static_ok_response,
+        HttpHeaderBuffer, is_get_request, write_dynamic_ok_response,
+        write_static_bad_request_error, write_static_content_not_found_error,
+        write_static_content_too_large_error, write_static_internal_server_error,
+        write_static_ok_response,
     },
 };
 
@@ -220,9 +221,16 @@ impl<'a> UringCore<'a> {
                 if !is_get_request(&request) {
                     write_static_bad_request_error(&mut response_header_buffer);
                 } else {
-                    match self.file_system_handler.open_raw_fd("./public/index.html") {
+                    let path = "./public/index.html";
+
+                    match self.file_system_handler.open_raw_fd(path) {
                         Ok(result) => {
-                            write_static_ok_response(&mut response_header_buffer);
+                            write_dynamic_ok_response(
+                                &mut response_header_buffer,
+                                path,
+                                result.size,
+                            );
+                            // write_static_ok_response(&mut response_header_buffer);
                             response_body = Some(result)
                         }
                         Err(e) if e.kind() == ErrorKind::NotFound => {
