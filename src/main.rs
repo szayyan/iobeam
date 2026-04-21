@@ -18,7 +18,7 @@ fn main() -> anyhow::Result<()> {
     let listener = TcpListener::bind(("127.0.0.1", 3456))?;
     let listener_fd = Fd(listener.as_raw_fd());
 
-    println!("listen {}", listener.local_addr()?);
+    println!("listening {}", listener.local_addr()?);
 
     let mut server = UringServer::new(
         listener_fd,
