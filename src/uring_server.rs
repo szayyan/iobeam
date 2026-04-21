@@ -1,4 +1,3 @@
-use arrayvec::ArrayVec;
 use io_uring::{
     CompletionQueue, IoUring, SubmissionQueue, Submitter, cqueue, opcode, squeue::Entry, types::Fd,
 };
@@ -256,7 +255,7 @@ impl<'a> UringCore<'a> {
                         Err(e) if e.kind() == ErrorKind::NotFound => {
                             write_static_content_not_found_error(&mut response_header_buffer);
                         }
-                        Err(e) => write_static_internal_server_error(&mut response_header_buffer),
+                        Err(_e) => write_static_internal_server_error(&mut response_header_buffer),
                     }
                 }
             }

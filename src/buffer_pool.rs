@@ -22,9 +22,9 @@ impl BufferPool {
         &self.alloc[index]
     }
 
-    pub unsafe fn get_unchecked<'a>(&'a self, index: usize) -> &'a [u8] {
-        unsafe { &self.alloc.get_unchecked(index) }
-    }
+    // pub unsafe fn get_unchecked<'a>(&'a self, index: usize) -> &'a [u8] {
+    //     unsafe { &self.alloc.get_unchecked(index) }
+    // }
 
     pub fn reuse_or_allocate(&mut self) -> (usize, &mut Box<[u8]>) {
         match self.pool.pop() {
