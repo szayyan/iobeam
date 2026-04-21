@@ -16,9 +16,14 @@ use crate::{
         HttpHeaderBuffer, is_get_request, write_dynamic_ok_response,
         write_static_bad_request_error, write_static_content_not_found_error,
         write_static_content_too_large_error, write_static_internal_server_error,
-        write_static_ok_response,
     },
 };
+
+pub enum WriteStrategy {
+    SendFile,
+    SendFileInAsyncEventLoop,
+    PipeAndSplice,
+}
 
 pub struct UringServer<'a> {
     core: UringCore<'a>,
@@ -27,6 +32,7 @@ pub struct UringServer<'a> {
 
 struct UringCore<'a> {
     listener: Fd,
+    write_strategy: WriteStrategy,
     file_system_handler: FileSystemHandler,
     usi: UringSubmissionInterface<'a>,
     buffer_pool: BufferPool,
@@ -113,9 +119,7 @@ impl<'a> UringSubmissionInterface<'a> {
 
         // If the multishot accept has ended, resubmit it.
         if !cqueue::more(flags) {
-            unsafe {
-                self.queue_multishot_accept(accept_fd, accept_user_data);
-            }
+            self.queue_multishot_accept(accept_fd, accept_user_data);
         }
     }
 
@@ -125,6 +129,15 @@ impl<'a> UringSubmissionInterface<'a> {
         unsafe {
             if self.sq.push(&close_entry).is_err() {
                 self.backlog.push_back(close_entry);
+            }
+        }
+    }
+
+    fn queue_noop(&mut self, user_data: u64) {
+        let noop_entry = opcode::Nop::new().build().user_data(user_data);
+        unsafe {
+            if self.sq.push(&noop_entry).is_err() {
+                self.backlog.push_back(noop_entry);
             }
         }
     }
@@ -153,6 +166,7 @@ impl<'a> UringSubmissionInterface<'a> {
 impl<'a> UringCore<'a> {
     fn new(
         listener: Fd,
+        write_strategy: WriteStrategy,
         file_system_handler: FileSystemHandler,
         submitter: Submitter<'a>,
         sq: SubmissionQueue<'a>,
@@ -161,6 +175,7 @@ impl<'a> UringCore<'a> {
     ) -> Self {
         Self {
             listener,
+            write_strategy,
             file_system_handler,
             usi: UringSubmissionInterface::new(submitter, sq),
             buffer_pool,
@@ -187,7 +202,12 @@ impl<'a> UringCore<'a> {
             } => {
                 self.handle_write_headers_token(fd, buf_index, offset, len, body, ret, token_index)
             }
-            Token::WriteBody { fd, offset, len } => self.handle_write_body_token(fd, offset, len),
+            Token::WriteBodySendFile {
+                fd,
+                body_fd,
+                offset,
+                len,
+            } => self.handle_write_body_token(fd, body_fd, offset, len, token_index),
             Token::Close => self.handle_close_token(token_index),
         }
     }
@@ -279,6 +299,40 @@ impl<'a> UringCore<'a> {
             .queue_send(Fd(fd), buf.as_ptr(), header_len, token_index as _);
     }
 
+    fn begin_write_body(&mut self, token_index: usize, fd: RawFd, body: FileResult) {
+        match self.write_strategy {
+            WriteStrategy::SendFile => {
+                let mut off: libc::off_t = 0;
+                let mut remaining = body.size;
+                while remaining > 0 {
+                    let n = unsafe { libc::sendfile(fd, body.fd, &mut off, remaining) };
+                    if n <= 0 {
+                        break;
+                    }
+                    remaining -= n as usize;
+                }
+                unsafe {
+                    libc::close(body.fd);
+                }
+
+                self.token_alloc[token_index] = Token::Close;
+                self.usi.queue_close(Fd(fd), token_index as _);
+            }
+            WriteStrategy::SendFileInAsyncEventLoop => {
+                self.token_alloc[token_index] = Token::WriteBodySendFile {
+                    fd,
+                    body_fd: body.fd,
+                    offset: 0,
+                    len: body.size,
+                };
+                self.usi.queue_noop(token_index as _);
+            }
+            WriteStrategy::PipeAndSplice => {
+                unimplemented!()
+            }
+        }
+    }
+
     fn handle_write_headers_token(
         &mut self,
         fd: RawFd,
@@ -294,24 +348,9 @@ impl<'a> UringCore<'a> {
 
         if write_complete {
             self.buffer_pool.return_to_pool(buf_index);
-
             if let Some(body) = body {
-                let mut off: libc::off_t = 0;
-                let mut remaining = body.size;
-                while remaining > 0 {
-                    let n = unsafe { libc::sendfile(fd, body.fd, &mut off, remaining) };
-                    if n <= 0 {
-                        break;
-                    }
-                    remaining -= n as usize;
-                }
-                unsafe {
-                    libc::close(body.fd);
-                }
+                self.begin_write_body(token_index, fd, body);
             }
-
-            self.token_alloc[token_index] = Token::Close;
-            self.usi.queue_close(Fd(fd), token_index as _);
         } else {
             // Partial write — send the remainder.
             let offset = offset + write_len;
@@ -332,8 +371,37 @@ impl<'a> UringCore<'a> {
         }
     }
 
-    fn handle_write_body_token(&mut self, _fd: RawFd, _offset: usize, _len: usize) {
-        unimplemented!()
+    fn handle_write_body_token(
+        &mut self,
+        fd: RawFd,
+        body_fd: RawFd,
+        offset: libc::off_t,
+        len: usize,
+        token_index: usize,
+    ) {
+        let chunk_size = len - offset as usize;
+
+        if chunk_size <= 0 {
+            self.token_alloc[token_index] = Token::Close;
+            self.usi.queue_close(Fd(fd), token_index as _);
+            return;
+        }
+
+        let mut off: libc::off_t = offset;
+        let n = unsafe { libc::sendfile(fd, body_fd, &mut off, chunk_size) };
+        let remaining = len as isize - n;
+        if n <= 0 || remaining <= 0 {
+            self.token_alloc[token_index] = Token::Close;
+            self.usi.queue_close(Fd(fd), token_index as _);
+            return;
+        }
+
+        self.token_alloc[token_index] = Token::WriteBodySendFile {
+            fd,
+            body_fd,
+            offset: off,
+            len: remaining as _,
+        }
     }
 
     fn handle_close_token(&mut self, token_index: usize) {
@@ -404,6 +472,7 @@ impl<'a> UringCore<'a> {
 impl<'a> UringServer<'a> {
     pub fn new(
         listener: Fd,
+        write_strategy: WriteStrategy,
         file_system_handler: FileSystemHandler,
         ring: &'a mut IoUring,
         buffer_pool: BufferPool,
@@ -414,6 +483,7 @@ impl<'a> UringServer<'a> {
         Self {
             core: UringCore::new(
                 listener,
+                write_strategy,
                 file_system_handler,
                 submitter,
                 sq,
@@ -465,9 +535,10 @@ pub enum Token {
         len: usize,
         body: Option<FileResult>,
     },
-    WriteBody {
+    WriteBodySendFile {
         fd: RawFd,
-        offset: usize,
+        body_fd: RawFd,
+        offset: libc::off_t,
         len: usize,
     },
     Close,

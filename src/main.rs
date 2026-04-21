@@ -22,6 +22,7 @@ fn main() -> anyhow::Result<()> {
 
     let mut server = UringServer::new(
         listener_fd,
+        uring_server::WriteStrategy::SendFileInAsyncEventLoop,
         file_system_handler,
         &mut ring,
         buffer_pool,
