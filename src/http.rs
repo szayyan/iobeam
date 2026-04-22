@@ -1,5 +1,8 @@
+use std::{borrow::Cow, path::Path, str::Utf8Error};
+
 use crate::buffer_pool::BUFFER_POOL_ITEM_SIZE;
 use arrayvec::ArrayVec;
+use percent_encoding::percent_decode_str;
 
 const RESPONSE_HEADER_BUFFER_SIZE: usize = 256;
 pub type HttpHeaderBuffer = ArrayVec<u8, RESPONSE_HEADER_BUFFER_SIZE>;
@@ -63,4 +66,9 @@ fn write_static_response_header(buf: &mut HttpHeaderBuffer, response: &[u8]) {
     unsafe {
         buf.try_extend_from_slice(response).unwrap_unchecked();
     }
+}
+
+pub fn decode_http_request_path(path: &str) -> anyhow::Result<Cow<'_, str>> {
+    let path = path.trim_end_matches('/');
+    Ok(percent_decode_str(path).decode_utf8()?)
 }

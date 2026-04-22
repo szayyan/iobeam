@@ -36,20 +36,14 @@ impl FileSystemHandler {
         })
     }
 
-    // warning: path must be constructed from valid utf8 or bad things will happen
     pub fn construct_and_validate_requested_path<'a>(
         &self,
-        // buf: &mut PathBuffer,
-        requested_path: &str,
+        path: &Path,
     ) -> anyhow::Result<PathBuffer> {
         let mut buf =
             PathBuffer::from(self.base_path).context("Path buffer length exceeded by base path")?;
 
-        let path = requested_path.trim_end_matches('/');
-        let path_decoded = percent_decode_str(path).decode_utf8()?;
-        let path_decoded = Path::new(&*path_decoded);
-
-        for component in path_decoded.components() {
+        for component in path.components() {
             match component {
                 Component::Normal(c) => {
                     // safe - we constructed from valid utf8
@@ -69,7 +63,6 @@ impl FileSystemHandler {
         Ok(buf)
     }
 
-    // two blocking syscalls - todo: benchmark uring equivalent
     pub fn open_raw_fd(&self, path: &str) -> Result<FileResult, std::io::Error> {
         let file = File::open(path)?;
         let file_size = file.metadata()?.size() as usize;

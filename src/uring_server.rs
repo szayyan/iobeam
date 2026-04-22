@@ -6,6 +6,7 @@ use std::{
     collections::VecDeque,
     io::{self, ErrorKind},
     os::fd::RawFd,
+    path::Path,
 };
 
 const SPLICE_CHUNK_SIZE: usize = 65536;
@@ -14,7 +15,7 @@ use crate::{
     buffer_pool::{BUFFER_POOL_ITEM_SIZE, BufferPool},
     file_system::{FileResult, FileSystemHandler},
     http::{
-        HttpHeaderBuffer, is_get_request, write_dynamic_ok_response,
+        HttpHeaderBuffer, decode_http_request_path, is_get_request, write_dynamic_ok_response,
         write_static_bad_request_error, write_static_content_not_found_error,
         write_static_content_too_large_error, write_static_internal_server_error,
     },
@@ -300,9 +301,10 @@ impl<'a> UringCore<'a> {
                     write_static_bad_request_error(&mut response_header_buffer);
                 } else {
                     let raw_path = request.path.unwrap_or("");
-                    let path_buffer = self
-                        .file_system_handler
-                        .construct_and_validate_requested_path(raw_path);
+                    let path_buffer = decode_http_request_path(raw_path).and_then(|v| {
+                        self.file_system_handler
+                            .construct_and_validate_requested_path(Path::new(&*v))
+                    });
 
                     let Ok(path) = path_buffer else {
                         write_static_bad_request_error(&mut response_header_buffer);
@@ -318,7 +320,6 @@ impl<'a> UringCore<'a> {
                                 path,
                                 result.size,
                             );
-                            // write_static_ok_response(&mut response_header_buffer);
                             response_body = Some(result)
                         }
                         Err(e) if e.kind() == ErrorKind::NotFound => {
