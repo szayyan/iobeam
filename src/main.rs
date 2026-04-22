@@ -3,7 +3,11 @@ use std::{net::TcpListener, os::fd::AsRawFd};
 use io_uring::{IoUring, types::Fd};
 use slab::Slab;
 
-use crate::{buffer_pool::BufferPool, file_system::FileSystemHandler, uring_server::UringServer};
+use crate::{
+    buffer_pool::BufferPool,
+    file_system::FileSystemHandler,
+    uring_server::{UringServer, WriteStrategy},
+};
 
 mod buffer_pool;
 mod file_system;
@@ -22,7 +26,7 @@ fn main() -> anyhow::Result<()> {
 
     let mut server = UringServer::new(
         listener_fd,
-        uring_server::WriteStrategy::SendFileInAsyncEventLoop,
+        WriteStrategy::PipeAndSplice,
         file_system_handler,
         &mut ring,
         buffer_pool,

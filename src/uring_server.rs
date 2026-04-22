@@ -8,6 +8,8 @@ use std::{
     os::fd::RawFd,
 };
 
+const SPLICE_CHUNK_SIZE: usize = 65536;
+
 use crate::{
     buffer_pool::{BUFFER_POOL_ITEM_SIZE, BufferPool},
     file_system::{FileResult, FileSystemHandler},
@@ -141,6 +143,27 @@ impl<'a> UringSubmissionInterface<'a> {
         }
     }
 
+    fn queue_splice(
+        &mut self,
+        fd_in: Fd,
+        off_in: i64,
+        fd_out: Fd,
+        off_out: i64,
+        len: u32,
+        flags: u32,
+        user_data: u64,
+    ) {
+        let splice_entry = opcode::Splice::new(fd_in, off_in, fd_out, off_out, len)
+            .flags(flags)
+            .build()
+            .user_data(user_data);
+        unsafe {
+            if self.sq.push(&splice_entry).is_err() {
+                self.backlog.push_back(splice_entry);
+            }
+        }
+    }
+
     fn sync_sq_and_empty_backlog(&mut self) -> io::Result<()> {
         loop {
             if self.sq.is_full() {
@@ -207,6 +230,42 @@ impl<'a> UringCore<'a> {
                 offset,
                 len,
             } => self.handle_write_body_token(fd, body_fd, offset, len, token_index),
+            Token::WriteBodySpliceFileToPipe {
+                fd,
+                body_fd,
+                pipe_read,
+                pipe_write,
+                file_offset,
+                remaining,
+            } => self.handle_splice_file_to_pipe_token(
+                fd,
+                body_fd,
+                pipe_read,
+                pipe_write,
+                file_offset,
+                remaining,
+                ret,
+                token_index,
+            ),
+            Token::WriteBodySplicePipeToSock {
+                fd,
+                body_fd,
+                pipe_read,
+                pipe_write,
+                file_offset,
+                remaining,
+                in_pipe,
+            } => self.handle_splice_pipe_to_sock_token(
+                fd,
+                body_fd,
+                pipe_read,
+                pipe_write,
+                file_offset,
+                remaining,
+                in_pipe,
+                ret,
+                token_index,
+            ),
             Token::Close => self.handle_close_token(token_index),
         }
     }
@@ -327,7 +386,26 @@ impl<'a> UringCore<'a> {
                 self.usi.queue_noop(token_index as _);
             }
             WriteStrategy::PipeAndSplice => {
-                unimplemented!()
+                let mut pipe_fds = [-1i32; 2];
+                unsafe { libc::pipe2(pipe_fds.as_mut_ptr(), libc::O_CLOEXEC) };
+                let chunk = body.size.min(SPLICE_CHUNK_SIZE) as u32;
+                self.token_alloc[token_index] = Token::WriteBodySpliceFileToPipe {
+                    fd,
+                    body_fd: body.fd,
+                    pipe_read: pipe_fds[0],
+                    pipe_write: pipe_fds[1],
+                    file_offset: 0,
+                    remaining: body.size,
+                };
+                self.usi.queue_splice(
+                    Fd(body.fd),
+                    0,
+                    Fd(pipe_fds[1]),
+                    -1,
+                    chunk,
+                    libc::SPLICE_F_MOVE | libc::SPLICE_F_MORE,
+                    token_index as _,
+                );
             }
         }
     }
@@ -400,6 +478,109 @@ impl<'a> UringCore<'a> {
             body_fd,
             offset: off,
             len: remaining as _,
+        }
+    }
+
+    fn handle_splice_file_to_pipe_token(
+        &mut self,
+        fd: RawFd,
+        body_fd: RawFd,
+        pipe_read: RawFd,
+        pipe_write: RawFd,
+        file_offset: i64,
+        remaining: usize,
+        ret: i32,
+        token_index: usize,
+    ) {
+        let spliced = ret as usize;
+        let new_file_offset = file_offset + spliced as i64;
+        let new_remaining = remaining - spliced;
+        let flags = libc::SPLICE_F_MOVE | if new_remaining > 0 { libc::SPLICE_F_MORE } else { 0 };
+        self.token_alloc[token_index] = Token::WriteBodySplicePipeToSock {
+            fd,
+            body_fd,
+            pipe_read,
+            pipe_write,
+            file_offset: new_file_offset,
+            remaining: new_remaining,
+            in_pipe: spliced,
+        };
+        self.usi.queue_splice(
+            Fd(pipe_read),
+            -1,
+            Fd(fd),
+            -1,
+            spliced as u32,
+            flags,
+            token_index as _,
+        );
+    }
+
+    fn handle_splice_pipe_to_sock_token(
+        &mut self,
+        fd: RawFd,
+        body_fd: RawFd,
+        pipe_read: RawFd,
+        pipe_write: RawFd,
+        file_offset: i64,
+        remaining: usize,
+        in_pipe: usize,
+        ret: i32,
+        token_index: usize,
+    ) {
+        let sent = ret as usize;
+        let still_in_pipe = in_pipe - sent;
+
+        if still_in_pipe > 0 {
+            // Partial splice to socket — drain remaining bytes in the pipe first.
+            let flags = libc::SPLICE_F_MOVE | if remaining > 0 { libc::SPLICE_F_MORE } else { 0 };
+            self.token_alloc[token_index] = Token::WriteBodySplicePipeToSock {
+                fd,
+                body_fd,
+                pipe_read,
+                pipe_write,
+                file_offset,
+                remaining,
+                in_pipe: still_in_pipe,
+            };
+            self.usi.queue_splice(
+                Fd(pipe_read),
+                -1,
+                Fd(fd),
+                -1,
+                still_in_pipe as u32,
+                flags,
+                token_index as _,
+            );
+        } else if remaining > 0 {
+            // Pipe drained — splice next chunk from file into pipe.
+            let chunk = remaining.min(SPLICE_CHUNK_SIZE) as u32;
+            self.token_alloc[token_index] = Token::WriteBodySpliceFileToPipe {
+                fd,
+                body_fd,
+                pipe_read,
+                pipe_write,
+                file_offset,
+                remaining,
+            };
+            self.usi.queue_splice(
+                Fd(body_fd),
+                file_offset,
+                Fd(pipe_write),
+                -1,
+                chunk,
+                libc::SPLICE_F_MOVE | libc::SPLICE_F_MORE,
+                token_index as _,
+            );
+        } else {
+            // All data sent — close pipe fds and the file fd, then close the socket.
+            unsafe {
+                libc::close(pipe_read);
+                libc::close(pipe_write);
+                libc::close(body_fd);
+            }
+            self.token_alloc[token_index] = Token::Close;
+            self.usi.queue_close(Fd(fd), token_index as _);
         }
     }
 
@@ -539,6 +720,23 @@ pub enum Token {
         body_fd: RawFd,
         offset: libc::off_t,
         len: usize,
+    },
+    WriteBodySpliceFileToPipe {
+        fd: RawFd,
+        body_fd: RawFd,
+        pipe_read: RawFd,
+        pipe_write: RawFd,
+        file_offset: i64,
+        remaining: usize,
+    },
+    WriteBodySplicePipeToSock {
+        fd: RawFd,
+        body_fd: RawFd,
+        pipe_read: RawFd,
+        pipe_write: RawFd,
+        file_offset: i64,
+        remaining: usize,
+        in_pipe: usize,
     },
     Close,
 }
