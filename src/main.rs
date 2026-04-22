@@ -15,7 +15,7 @@ mod http;
 mod uring_server;
 
 fn main() -> anyhow::Result<()> {
-    let file_system_handler = FileSystemHandler {};
+    let file_system_handler = FileSystemHandler::new(".")?;
     let token_alloc = Slab::with_capacity(64);
     let buffer_pool = BufferPool::new(64);
     let mut ring = IoUring::new(256)?;

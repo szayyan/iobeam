@@ -299,7 +299,17 @@ impl<'a> UringCore<'a> {
                 if !is_get_request(&request) {
                     write_static_bad_request_error(&mut response_header_buffer);
                 } else {
-                    let path = "./public/index.html";
+                    let raw_path = request.path.unwrap_or("");
+                    let path_buffer = self
+                        .file_system_handler
+                        .construct_and_validate_requested_path(raw_path);
+
+                    let Ok(path) = path_buffer else {
+                        write_static_bad_request_error(&mut response_header_buffer);
+                        return;
+                    };
+
+                    let path = path.as_str();
 
                     match self.file_system_handler.open_raw_fd(path) {
                         Ok(result) => {
@@ -495,7 +505,12 @@ impl<'a> UringCore<'a> {
         let spliced = ret as usize;
         let new_file_offset = file_offset + spliced as i64;
         let new_remaining = remaining - spliced;
-        let flags = libc::SPLICE_F_MOVE | if new_remaining > 0 { libc::SPLICE_F_MORE } else { 0 };
+        let flags = libc::SPLICE_F_MOVE
+            | if new_remaining > 0 {
+                libc::SPLICE_F_MORE
+            } else {
+                0
+            };
         self.token_alloc[token_index] = Token::WriteBodySplicePipeToSock {
             fd,
             body_fd,
@@ -533,7 +548,12 @@ impl<'a> UringCore<'a> {
 
         if still_in_pipe > 0 {
             // Partial splice to socket — drain remaining bytes in the pipe first.
-            let flags = libc::SPLICE_F_MOVE | if remaining > 0 { libc::SPLICE_F_MORE } else { 0 };
+            let flags = libc::SPLICE_F_MOVE
+                | if remaining > 0 {
+                    libc::SPLICE_F_MORE
+                } else {
+                    0
+                };
             self.token_alloc[token_index] = Token::WriteBodySplicePipeToSock {
                 fd,
                 body_fd,

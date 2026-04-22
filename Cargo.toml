@@ -14,4 +14,5 @@ io-uring = "0.7.12"
 itoa = "1.0.18"
 libc = { version = "0.2.185", default-features = false }
 mime_guess = "2.0.5"
+percent-encoding = "2.3.2"
 slab = "0.4.12"
