@@ -1,3 +1,6 @@
+[workspace]
+members = [".", "benchmarks/micro"]
+
 [package]
 name = "iobeam"
 version = "0.1.0"
@@ -7,7 +10,7 @@ edition = "2024"
 anyhow = "1.0.102"
 arrayvec = "0.7.6"
 httparse = "1.10.1"
-io-uring = "0.7.11"
+io-uring = "0.7.12"
 itoa = "1.0.18"
 libc = { version = "0.2.185", default-features = false }
 mime_guess = "2.0.5"

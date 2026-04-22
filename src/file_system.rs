@@ -15,6 +15,7 @@ pub struct FileResult {
 pub struct FileSystemHandler;
 
 impl FileSystemHandler {
+    // two blocking syscalls - todo: benchmark uring equivalent
     pub fn open_raw_fd(&self, path: &str) -> Result<FileResult, std::io::Error> {
         let file = File::open(path)?;
         let file_size = file.metadata()?.size() as usize;
