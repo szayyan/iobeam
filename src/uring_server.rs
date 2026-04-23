@@ -303,30 +303,32 @@ impl<'a> UringCore<'a> {
                     let raw_path = request.path.unwrap_or("");
                     let path_buffer = decode_http_request_path(raw_path).and_then(|v| {
                         self.file_system_handler
-                            .construct_and_validate_requested_path(Path::new(&*v))
+                            .construct_and_validate_decoded_path(Path::new(&*v))
                     });
-
-                    let Ok(path) = path_buffer else {
+                    if let Ok(path) = path_buffer {
+                        let path = path.as_str();
+                        match self.file_system_handler.open_raw_ffd(path) {
+                            Ok(result) => {
+                                write_dynamic_ok_response(
+                                    &mut response_header_buffer,
+                                    path,
+                                    result.size,
+                                );
+                                response_body = Some(result)
+                            }
+                            Err(e)
+                                if e.kind() == ErrorKind::NotFound
+                                    || e.kind() == ErrorKind::IsADirectory =>
+                            {
+                                write_static_content_not_found_error(&mut response_header_buffer);
+                            }
+                            Err(_e) => {
+                                write_static_internal_server_error(&mut response_header_buffer)
+                            }
+                        }
+                    } else {
                         write_static_bad_request_error(&mut response_header_buffer);
-                        return;
                     };
-
-                    let path = path.as_str();
-
-                    match self.file_system_handler.open_raw_fd(path) {
-                        Ok(result) => {
-                            write_dynamic_ok_response(
-                                &mut response_header_buffer,
-                                path,
-                                result.size,
-                            );
-                            response_body = Some(result)
-                        }
-                        Err(e) if e.kind() == ErrorKind::NotFound => {
-                            write_static_content_not_found_error(&mut response_header_buffer);
-                        }
-                        Err(_e) => write_static_internal_server_error(&mut response_header_buffer),
-                    }
                 }
             }
             Ok(httparse::Status::Partial) => {
@@ -438,6 +440,9 @@ impl<'a> UringCore<'a> {
             self.buffer_pool.return_to_pool(buf_index);
             if let Some(body) = body {
                 self.begin_write_body(token_index, fd, body);
+            } else {
+                self.token_alloc[token_index] = Token::Close;
+                self.usi.queue_close(Fd(fd), token_index as _);
             }
         } else {
             // Partial write — send the remainder.
@@ -498,13 +503,13 @@ impl<'a> UringCore<'a> {
         body_fd: RawFd,
         pipe_read: RawFd,
         pipe_write: RawFd,
-        file_offset: i64,
+        file_offset: libc::off_t,
         remaining: usize,
         ret: i32,
         token_index: usize,
     ) {
         let spliced = ret as usize;
-        let new_file_offset = file_offset + spliced as i64;
+        let new_file_offset = file_offset + spliced as libc::off_t;
         let new_remaining = remaining - spliced;
         let flags = libc::SPLICE_F_MOVE
             | if new_remaining > 0 {
@@ -747,7 +752,7 @@ pub enum Token {
         body_fd: RawFd,
         pipe_read: RawFd,
         pipe_write: RawFd,
-        file_offset: i64,
+        file_offset: libc::off_t,
         remaining: usize,
     },
     WriteBodySplicePipeToSock {
@@ -755,7 +760,7 @@ pub enum Token {
         body_fd: RawFd,
         pipe_read: RawFd,
         pipe_write: RawFd,
-        file_offset: i64,
+        file_offset: libc::off_t,
         remaining: usize,
         in_pipe: usize,
     },

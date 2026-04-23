@@ -24,10 +24,7 @@ pub fn write_static_bad_request_error(buf: &mut HttpHeaderBuffer) {
 }
 
 pub fn write_static_content_not_found_error(buf: &mut HttpHeaderBuffer) {
-    write_static_response_header(
-        buf,
-        b"HTTP/1.1 413 Content Too Large\r\nContent-Length: 0\r\n\r\n",
-    );
+    write_static_response_header(buf, b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n");
 }
 
 pub fn write_static_content_too_large_error(buf: &mut HttpHeaderBuffer) {
@@ -69,6 +66,6 @@ fn write_static_response_header(buf: &mut HttpHeaderBuffer, response: &[u8]) {
 }
 
 pub fn decode_http_request_path(path: &str) -> anyhow::Result<Cow<'_, str>> {
-    let path = path.trim_end_matches('/');
+    let path = path.trim_start_matches('/');
     Ok(percent_decode_str(path).decode_utf8()?)
 }

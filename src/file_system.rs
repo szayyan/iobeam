@@ -36,7 +36,7 @@ impl FileSystemHandler {
         })
     }
 
-    pub fn construct_and_validate_requested_path<'a>(
+    pub fn construct_and_validate_decoded_path<'a>(
         &self,
         path: &Path,
     ) -> anyhow::Result<PathBuffer> {
@@ -48,6 +48,11 @@ impl FileSystemHandler {
                 Component::Normal(c) => {
                     // safe - we constructed from valid utf8
                     let cstr = unsafe { std::str::from_utf8_unchecked(c.as_bytes()) };
+                    if buf.try_push('/').is_err() {
+                        bail!(
+                            "Path buffer length exceeded. Total path length must be < PATH_MAX_LENGTH."
+                        );
+                    }
                     if buf.try_push_str(cstr).is_err() {
                         bail!(
                             "Path buffer length exceeded. Total path length must be < PATH_MAX_LENGTH."
@@ -63,13 +68,21 @@ impl FileSystemHandler {
         Ok(buf)
     }
 
-    pub fn open_raw_fd(&self, path: &str) -> Result<FileResult, std::io::Error> {
+    pub fn open_raw_ffd(&self, path: &str) -> anyhow::Result<FileResult, std::io::Error> {
         let file = File::open(path)?;
-        let file_size = file.metadata()?.size() as usize;
+        let mdata = file.metadata()?;
+
+        if mdata.is_dir() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::IsADirectory,
+                "Requested path must be a file.",
+            ));
+        }
+
         let ffd = file.into_raw_fd();
         Ok(FileResult {
             fd: ffd,
-            size: file_size,
+            size: mdata.size() as _,
         })
     }
 }
