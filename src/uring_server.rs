@@ -9,7 +9,9 @@ use std::{
     path::Path,
 };
 
-const SPLICE_CHUNK_SIZE: usize = 65536;
+// 256Kb chunks
+const SPLICE_CHUNK_SIZE: usize = 256 * 1024;
+const SENDFILE_CHUNK_SIZE: usize = 256 * 1024;
 
 use crate::{
     buffer_pool::{BUFFER_POOL_ITEM_SIZE, BufferPool},
@@ -376,7 +378,9 @@ impl<'a> UringCore<'a> {
                 let mut off: libc::off_t = 0;
                 let mut remaining = body.size;
                 while remaining > 0 {
-                    let n = unsafe { libc::sendfile(fd, body.fd, &mut off, remaining) };
+                    let n = unsafe {
+                        libc::sendfile(fd, body.fd, &mut off, remaining.min(SENDFILE_CHUNK_SIZE))
+                    };
                     if n <= 0 {
                         break;
                     }
@@ -472,7 +476,7 @@ impl<'a> UringCore<'a> {
         len: usize,
         token_index: usize,
     ) {
-        let chunk_size = len - offset as usize;
+        let chunk_size = (len - offset as usize).min(SENDFILE_CHUNK_SIZE);
 
         if chunk_size <= 0 {
             self.token_alloc[token_index] = Token::Close;
