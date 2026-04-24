@@ -1,5 +1,5 @@
 [workspace]
-members = [".", "benchmarks/micro"]
+members = [".", "benchmarks/micro", "benchmarks/scripts"]
 
 [package]
 name = "iobeam"
