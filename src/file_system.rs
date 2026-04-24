@@ -9,7 +9,6 @@ use std::{
 
 use anyhow::{Context, bail};
 use arrayvec::ArrayString;
-use percent_encoding::{percent_decode, percent_decode_str};
 // use percent_encoding::{percent_decode, percent_decode_str};
 
 #[derive(Clone, Debug, Copy)]
@@ -19,43 +18,43 @@ pub struct FileResult {
 }
 
 pub struct FileSystemHandler {
-    base_path: &'static str,
+    base_path: PathBuffer,
 }
 
 const LINUX_PATH_MAX_LENGTH: usize = 4096;
 type PathBuffer = ArrayString<LINUX_PATH_MAX_LENGTH>;
 
 impl FileSystemHandler {
-    pub fn new(serve_dir: &'static str) -> anyhow::Result<Self> {
+    pub fn new(serve_dir: &str) -> anyhow::Result<Self> {
         if !Path::new(serve_dir).is_dir() {
             bail!("serve directory must be a directory")
         }
 
-        Ok(FileSystemHandler {
-            base_path: serve_dir,
-        })
+        let Ok(base_path) = PathBuffer::from(serve_dir) else {
+            bail!("serve dir length > MAX PATH LENGTH")
+        };
+
+        Ok(FileSystemHandler { base_path })
     }
 
+    // warning path must be constructed from valid utf8 or undefined behaviour
     pub fn construct_and_validate_decoded_path<'a>(
         &self,
         path: &Path,
     ) -> anyhow::Result<PathBuffer> {
-        let mut buf =
-            PathBuffer::from(self.base_path).context("Path buffer length exceeded by base path")?;
-
+        let mut buf = self.base_path; // bwise stack copy - v. cheap
         for component in path.components() {
             match component {
                 Component::Normal(c) => {
-                    // safe - we constructed from valid utf8
                     let cstr = unsafe { std::str::from_utf8_unchecked(c.as_bytes()) };
                     if buf.try_push('/').is_err() {
                         bail!(
-                            "Path buffer length exceeded. Total path length must be < PATH_MAX_LENGTH."
+                            "Request path buffer length exceeded. Total path length must be < PATH_MAX_LENGTH."
                         );
                     }
                     if buf.try_push_str(cstr).is_err() {
                         bail!(
-                            "Path buffer length exceeded. Total path length must be < PATH_MAX_LENGTH."
+                            "Request path buffer length exceeded. Total path length must be < PATH_MAX_LENGTH."
                         );
                     }
                 }

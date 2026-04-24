@@ -26,15 +26,24 @@ impl BufferPool {
     //     unsafe { &self.alloc.get_unchecked(index) }
     // }
 
+    pub fn allocate_range(&mut self, range: usize) {
+        for _ in 0..range {
+            let (idx, _) = self.allocate_internal();
+            self.pool.push(idx);
+        }
+    }
+
+    fn allocate_internal(&mut self) -> (usize, &mut Box<[u8]>) {
+        let buf = vec![0u8; BUFFER_POOL_ITEM_SIZE].into_boxed_slice();
+        let entry = self.alloc.vacant_entry();
+        let index = entry.key();
+        (index, entry.insert(buf))
+    }
+
     pub fn reuse_or_allocate(&mut self) -> (usize, &mut Box<[u8]>) {
         match self.pool.pop() {
             Some(index) => (index, &mut self.alloc[index]),
-            None => {
-                let buf = vec![0u8; BUFFER_POOL_ITEM_SIZE].into_boxed_slice();
-                let entry = self.alloc.vacant_entry();
-                let index = entry.key();
-                (index, entry.insert(buf))
-            }
+            None => self.allocate_internal(),
         }
     }
 

@@ -9,6 +9,7 @@ edition = "2024"
 [dependencies]
 anyhow = "1.0.102"
 arrayvec = "0.7.6"
+clap = "4.6.1"
 httparse = "1.10.1"
 io-uring = "0.7.12"
 itoa = "1.0.18"

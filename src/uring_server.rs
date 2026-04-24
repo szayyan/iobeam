@@ -9,9 +9,6 @@ use std::{
     path::Path,
 };
 
-// 256Kb chunks
-const SPLICE_CHUNK_SIZE: usize = 256 * 1024;
-const SENDFILE_CHUNK_SIZE: usize = 256 * 1024;
 
 use crate::{
     buffer_pool::{BUFFER_POOL_ITEM_SIZE, BufferPool},
@@ -41,6 +38,7 @@ struct UringCore<'a> {
     usi: UringSubmissionInterface<'a>,
     buffer_pool: BufferPool,
     token_alloc: Slab<Token>,
+    body_write_chunk_size: usize,
 }
 
 struct UringSubmissionInterface<'a> {
@@ -197,6 +195,7 @@ impl<'a> UringCore<'a> {
         sq: SubmissionQueue<'a>,
         buffer_pool: BufferPool,
         token_alloc: Slab<Token>,
+        body_write_chunk_size: usize,
     ) -> Self {
         Self {
             listener,
@@ -205,6 +204,7 @@ impl<'a> UringCore<'a> {
             usi: UringSubmissionInterface::new(submitter, sq),
             buffer_pool,
             token_alloc,
+            body_write_chunk_size,
         }
     }
 
@@ -379,7 +379,7 @@ impl<'a> UringCore<'a> {
                 let mut remaining = body.size;
                 while remaining > 0 {
                     let n = unsafe {
-                        libc::sendfile(fd, body.fd, &mut off, remaining.min(SENDFILE_CHUNK_SIZE))
+                        libc::sendfile(fd, body.fd, &mut off, remaining.min(self.body_write_chunk_size))
                     };
                     if n <= 0 {
                         break;
@@ -405,7 +405,7 @@ impl<'a> UringCore<'a> {
             WriteStrategy::PipeAndSplice => {
                 let mut pipe_fds = [-1i32; 2];
                 unsafe { libc::pipe2(pipe_fds.as_mut_ptr(), libc::O_CLOEXEC) };
-                let chunk = body.size.min(SPLICE_CHUNK_SIZE) as u32;
+                let chunk = body.size.min(self.body_write_chunk_size) as u32;
                 self.token_alloc[token_index] = Token::WriteBodySpliceFileToPipe {
                     fd,
                     body_fd: body.fd,
@@ -476,7 +476,7 @@ impl<'a> UringCore<'a> {
         len: usize,
         token_index: usize,
     ) {
-        let chunk_size = (len - offset as usize).min(SENDFILE_CHUNK_SIZE);
+        let chunk_size = (len - offset as usize).min(self.body_write_chunk_size);
 
         if chunk_size <= 0 {
             self.token_alloc[token_index] = Token::Close;
@@ -584,7 +584,7 @@ impl<'a> UringCore<'a> {
             );
         } else if remaining > 0 {
             // Pipe drained — splice next chunk from file into pipe.
-            let chunk = remaining.min(SPLICE_CHUNK_SIZE) as u32;
+            let chunk = remaining.min(self.body_write_chunk_size) as u32;
             self.token_alloc[token_index] = Token::WriteBodySpliceFileToPipe {
                 fd,
                 body_fd,
@@ -687,6 +687,7 @@ impl<'a> UringServer<'a> {
         ring: &'a mut IoUring,
         buffer_pool: BufferPool,
         token_alloc: Slab<Token>,
+        body_write_chunk_size: usize,
     ) -> UringServer<'a> {
         let (submitter, sq, cq) = ring.split();
 
@@ -699,6 +700,7 @@ impl<'a> UringServer<'a> {
                 sq,
                 buffer_pool,
                 token_alloc,
+                body_write_chunk_size,
             ),
             cq,
         }
