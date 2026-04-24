@@ -7,7 +7,7 @@ use std::{
     path::{Component, Path},
 };
 
-use anyhow::{Context, bail};
+use anyhow::bail;
 use arrayvec::ArrayString;
 // use percent_encoding::{percent_decode, percent_decode_str};
 

@@ -1,4 +1,4 @@
-use std::{borrow::Cow, path::Path, str::Utf8Error};
+use std::borrow::Cow;
 
 use crate::buffer_pool::BUFFER_POOL_ITEM_SIZE;
 use arrayvec::ArrayVec;
