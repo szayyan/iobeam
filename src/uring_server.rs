@@ -9,7 +9,6 @@ use std::{
     path::Path,
 };
 
-
 use crate::{
     buffer_pool::{BUFFER_POOL_ITEM_SIZE, BufferPool},
     file_system::{FileResult, FileSystemHandler},
@@ -273,7 +272,6 @@ impl<'a> UringCore<'a> {
         }
     }
 
-    // TODO: performance test - better to write directly to heap buffer or accumulate in stack and one copy straight to heap
     fn handle_read_token(
         &mut self,
         fd: RawFd,
@@ -379,7 +377,12 @@ impl<'a> UringCore<'a> {
                 let mut remaining = body.size;
                 while remaining > 0 {
                     let n = unsafe {
-                        libc::sendfile(fd, body.fd, &mut off, remaining.min(self.body_write_chunk_size))
+                        libc::sendfile(
+                            fd,
+                            body.fd,
+                            &mut off,
+                            remaining.min(self.body_write_chunk_size),
+                        )
                     };
                     if n <= 0 {
                         break;
@@ -479,6 +482,9 @@ impl<'a> UringCore<'a> {
         let chunk_size = (len - offset as usize).min(self.body_write_chunk_size);
 
         if chunk_size <= 0 {
+            unsafe {
+                libc::close(body_fd);
+            }
             self.token_alloc[token_index] = Token::Close;
             self.usi.queue_close(Fd(fd), token_index as _);
             return;
@@ -488,6 +494,9 @@ impl<'a> UringCore<'a> {
         let n = unsafe { libc::sendfile(fd, body_fd, &mut off, chunk_size) };
         let remaining = len as isize - n;
         if n <= 0 || remaining <= 0 {
+            unsafe {
+                libc::close(body_fd);
+            }
             self.token_alloc[token_index] = Token::Close;
             self.usi.queue_close(Fd(fd), token_index as _);
             return;
@@ -667,6 +676,14 @@ impl<'a> UringCore<'a> {
                 // in both cases the fd is already closed so remove from token_alloc and continue
                 self.token_alloc.remove(token_index);
             }
+            Some(Token::WriteBodySendFile { body_fd, .. }) => {
+                println!("send file fail - closing requested file fd");
+                unsafe {
+                    libc::close(*body_fd);
+                }
+            }
+            Some(Token::WriteBodySpliceFileToPipe { .. }) => {}
+            Some(Token::WriteBodySplicePipeToSock { .. }) => {}
             // TODO: consider how to handle other event failures
             _ => {}
         }
