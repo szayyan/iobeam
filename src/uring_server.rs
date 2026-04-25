@@ -124,8 +124,8 @@ impl<'a> UringSubmissionInterface<'a> {
         }
     }
 
-    fn queue_close(&mut self, fd: Fd, user_data: u64) {
-        let close_entry = opcode::Close::new(fd).build().user_data(user_data);
+    fn queue_close(&mut self, fd: Fd) {
+        let close_entry = opcode::Close::new(fd).build().user_data(NO_USER_DATA);
 
         unsafe {
             if self.sq.push(&close_entry).is_err() {
@@ -268,7 +268,6 @@ impl<'a> UringCore<'a> {
                 ret,
                 token_index,
             ),
-            Token::Close => self.handle_close_token(token_index),
         }
     }
 
@@ -282,8 +281,9 @@ impl<'a> UringCore<'a> {
     ) {
         if ret == 0 {
             self.buffer_pool.return_to_pool(buf_index);
-            self.token_alloc[token_index] = Token::Close;
-            self.usi.queue_close(Fd(fd), token_index as _);
+            self.token_alloc.remove(token_index);
+            self.usi.queue_close(Fd(fd));
+            println!("invalid read - closing connection");
             return;
         }
 
@@ -393,8 +393,9 @@ impl<'a> UringCore<'a> {
                     libc::close(body.fd);
                 }
 
-                self.token_alloc[token_index] = Token::Close;
-                self.usi.queue_close(Fd(fd), token_index as _);
+                self.token_alloc.remove(token_index);
+                self.usi.queue_close(Fd(fd));
+                println!("closing connection");
             }
             WriteStrategy::SendFileInAsyncEventLoop => {
                 self.token_alloc[token_index] = Token::WriteBodySendFile {
@@ -448,8 +449,9 @@ impl<'a> UringCore<'a> {
             if let Some(body) = body {
                 self.begin_write_body(token_index, fd, body);
             } else {
-                self.token_alloc[token_index] = Token::Close;
-                self.usi.queue_close(Fd(fd), token_index as _);
+                self.token_alloc.remove(token_index);
+                self.usi.queue_close(Fd(fd));
+                println!("closing connection");
             }
         } else {
             // Partial write — send the remainder.
@@ -482,11 +484,11 @@ impl<'a> UringCore<'a> {
         let chunk_size = (len - offset as usize).min(self.body_write_chunk_size);
 
         if chunk_size <= 0 {
-            unsafe {
-                libc::close(body_fd);
-            }
-            self.token_alloc[token_index] = Token::Close;
-            self.usi.queue_close(Fd(fd), token_index as _);
+            self.token_alloc.remove(token_index);
+            self.usi.queue_close(Fd(fd));
+            self.usi.queue_close(Fd(body_fd));
+
+            println!("closing connection");
             return;
         }
 
@@ -494,11 +496,11 @@ impl<'a> UringCore<'a> {
         let n = unsafe { libc::sendfile(fd, body_fd, &mut off, chunk_size) };
         let remaining = len as isize - n;
         if n <= 0 || remaining <= 0 {
-            unsafe {
-                libc::close(body_fd);
-            }
-            self.token_alloc[token_index] = Token::Close;
-            self.usi.queue_close(Fd(fd), token_index as _);
+            self.token_alloc.remove(token_index);
+            self.usi.queue_close(Fd(fd));
+            self.usi.queue_close(Fd(body_fd));
+
+            println!("closing connection");
             return;
         }
 
@@ -613,19 +615,14 @@ impl<'a> UringCore<'a> {
             );
         } else {
             // All data sent — close pipe fds and the file fd, then close the socket.
-            unsafe {
-                libc::close(pipe_read);
-                libc::close(pipe_write);
-                libc::close(body_fd);
-            }
-            self.token_alloc[token_index] = Token::Close;
-            self.usi.queue_close(Fd(fd), token_index as _);
-        }
-    }
+            self.token_alloc.remove(token_index);
+            self.usi.queue_close(Fd(fd));
+            self.usi.queue_close(Fd(pipe_read));
+            self.usi.queue_close(Fd(pipe_write));
+            self.usi.queue_close(Fd(body_fd));
 
-    fn handle_close_token(&mut self, token_index: usize) {
-        println!("connection CLOSED");
-        self.token_alloc.remove(token_index);
+            println!("closing connection");
+        }
     }
 
     fn handle_poll_token(&mut self, fd: RawFd, token_index: usize) {
@@ -659,34 +656,57 @@ impl<'a> UringCore<'a> {
     }
 
     fn handle_error_event(&mut self, ret: i32, token_index: usize) {
-        let token = self.token_alloc.get(token_index);
         let error = io::Error::from_raw_os_error(-ret);
+        let token = self.token_alloc.get(token_index);
 
-        eprintln!("token {:?} error: {:?}", token, error);
+        eprintln!(
+            "token {:?} error: {:?}",
+            self.token_alloc.get(token_index),
+            error
+        );
 
         match token {
+            None => return,
             Some(Token::Accept) => {
                 self.usi
                     .queue_multishot_accept(self.listener, token_index as _);
+                return;
             }
-            Some(Token::Close) => {
-                // close has failed with either
-                // - EBADF — fd is not valid (double-close)
-                // - EINTR — interrupted by a signal
-                // in both cases the fd is already closed so remove from token_alloc and continue
-                self.token_alloc.remove(token_index);
-            }
-            Some(Token::WriteBodySendFile { body_fd, .. }) => {
+            Some(Token::WriteBodySendFile { fd, body_fd, .. }) => {
                 println!("send file fail - closing requested file fd");
-                unsafe {
-                    libc::close(*body_fd);
-                }
+                self.usi.queue_close(Fd(*body_fd));
+                self.usi.queue_close(Fd(*fd));
             }
-            Some(Token::WriteBodySpliceFileToPipe { .. }) => {}
-            Some(Token::WriteBodySplicePipeToSock { .. }) => {}
+            Some(Token::WriteBodySpliceFileToPipe {
+                fd,
+                body_fd,
+                pipe_read,
+                pipe_write,
+                ..
+            }) => {
+                println!("closing connection");
+                self.usi.queue_close(Fd(*fd));
+                self.usi.queue_close(Fd(*pipe_read));
+                self.usi.queue_close(Fd(*pipe_write));
+                self.usi.queue_close(Fd(*body_fd));
+            }
+            Some(Token::WriteBodySplicePipeToSock {
+                fd,
+                body_fd,
+                pipe_read,
+                pipe_write,
+                ..
+            }) => {
+                println!("closing connection");
+                self.usi.queue_close(Fd(*fd));
+                self.usi.queue_close(Fd(*pipe_read));
+                self.usi.queue_close(Fd(*pipe_write));
+                self.usi.queue_close(Fd(*body_fd));
+            }
             // TODO: consider how to handle other event failures
             _ => {}
         }
+        self.token_alloc.remove(token_index);
     }
 
     fn prep_initial_accept(&mut self) {
@@ -734,17 +754,21 @@ impl<'a> UringServer<'a> {
             for cqe in &mut self.cq {
                 let ret = cqe.result();
                 let flags = cqe.flags();
-                let token_index = cqe.user_data() as usize;
+                let user_data = cqe.user_data();
 
-                if ret < 0 {
-                    self.core.handle_error_event(ret, token_index);
+                if user_data == NO_USER_DATA {
+                    continue;
+                } else if ret < 0 {
+                    self.core.handle_error_event(ret, user_data as _);
                 } else {
-                    self.core.handle_event(ret, token_index, flags);
+                    self.core.handle_event(ret, user_data as _, flags);
                 }
             }
         }
     }
 }
+
+const NO_USER_DATA: u64 = u64::MAX;
 
 #[derive(Clone, Debug)]
 pub enum Token {
@@ -787,5 +811,4 @@ pub enum Token {
         remaining: usize,
         in_pipe: usize,
     },
-    Close,
 }
