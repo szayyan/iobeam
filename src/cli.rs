@@ -1,7 +1,7 @@
 use crate::uring_server::WriteStrategy;
 use clap::Parser;
 
-#[derive(Parser)]
+#[derive(Clone, Parser)]
 #[command(about = "experimental io_uring HTTP file server")]
 pub struct Cli {
     /// Directory to serve files from
@@ -31,6 +31,10 @@ pub struct Cli {
     /// TCP listener backlog
     #[arg(long, default_value_t = 1024)]
     pub backlog: i32,
+
+    /// Number of worker threads
+    #[arg(long, default_value_t = 4)]
+    pub threads: usize,
 }
 
 impl Cli {

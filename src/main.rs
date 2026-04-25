@@ -17,28 +17,43 @@ mod uring_server;
 fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
-    let file_system_handler = FileSystemHandler::new(&cli.dir)?;
-    let token_alloc = Slab::with_capacity(64);
-    let mut buffer_pool = BufferPool::new(64);
-    buffer_pool.allocate_range(64);
-    let mut ring = IoUring::new(cli.uring_entries)?;
+    info!("starting server on {}:{}", &cli.bind, cli.port);
 
-    // this fd is not closed by the program
-    // bc its unncessary. a benign fd leak
-    let listener = make_tcp_listener(&cli.bind, cli.port, cli.backlog)?;
+    let handles: Vec<_> = (0..cli.threads)
+        .map(|_| {
+            let cli = cli.clone();
+            std::thread::spawn(move || -> anyhow::Result<()> {
+                // this fd is not closed by the program
+                // bc its unncessary. a benign fd leak
+                let listener = make_tcp_listener(&cli.bind, cli.port, cli.backlog)?;
+                let file_system_handler = FileSystemHandler::new(&cli.dir)?;
+                let token_alloc = Slab::with_capacity(64);
+                let mut buffer_pool = BufferPool::new(64);
+                buffer_pool.allocate_range(64);
+                let mut ring = IoUring::new(cli.uring_entries)?;
 
-    info!("listening on {}:{}", &cli.bind, cli.port);
+                let mut server = UringServer::new(
+                    listener,
+                    cli.write_strategy,
+                    file_system_handler,
+                    &mut ring,
+                    buffer_pool,
+                    token_alloc,
+                    cli.body_write_chunk_size,
+                );
+                server.start_event_loop()?;
 
-    let mut server = UringServer::new(
-        listener,
-        cli.write_strategy,
-        file_system_handler,
-        &mut ring,
-        buffer_pool,
-        token_alloc,
-        cli.body_write_chunk_size,
-    );
-    server.start_event_loop()?;
+                Ok(())
+            })
+        })
+        .collect();
+
+    for handle in handles {
+        if let Err(e) = handle.join() {
+            error!("Worker thread panicked: {:?}", e);
+            std::process::exit(1);
+        }
+    }
 
     Ok(())
 }
