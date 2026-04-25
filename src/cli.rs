@@ -10,7 +10,7 @@ pub struct Cli {
 
     /// Host address to listen on
     #[arg(long, default_value = "127.0.0.1")]
-    pub host: String,
+    pub bind: String,
 
     /// Port to listen on
     #[arg(short, long, default_value_t = 3456)]
@@ -27,6 +27,10 @@ pub struct Cli {
     /// Strategy used to write the response body
     #[arg(long, default_value = "pipe-and-splice")]
     pub write_strategy: WriteStrategy,
+
+    /// TCP listener backlog
+    #[arg(long, default_value_t = 1024)]
+    pub backlog: i32,
 }
 
 impl Cli {
