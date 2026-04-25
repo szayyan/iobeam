@@ -10,7 +10,7 @@ edition = "2024"
 anyhow = "1.0.102"
 arrayvec = "0.7.6"
 chrono = "0.4.44"
-clap = "4.6.1"
+clap = { version = "4.6.1", features = ["derive"] }
 httparse = "1.10.1"
 io-uring = "0.7.12"
 itoa = "1.0.18"

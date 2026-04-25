@@ -19,6 +19,7 @@ use crate::{
     },
 };
 
+#[derive(Clone, clap::ValueEnum)]
 pub enum WriteStrategy {
     SendFile,
     SendFileInAsyncEventLoop,
