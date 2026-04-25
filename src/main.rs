@@ -1,16 +1,16 @@
-use std::{net::TcpListener, os::fd::AsRawFd};
-
-use io_uring::{IoUring, types::Fd};
-use slab::Slab;
-
 use crate::{
     buffer_pool::BufferPool, cli::Cli, file_system::FileSystemHandler, uring_server::UringServer,
 };
+use io_uring::{IoUring, types::Fd};
+use slab::Slab;
+use std::{net::TcpListener, os::fd::AsRawFd};
 
 mod buffer_pool;
 mod cli;
 mod file_system;
 mod http;
+#[macro_use]
+mod log;
 mod uring_server;
 
 fn main() -> anyhow::Result<()> {
@@ -25,7 +25,7 @@ fn main() -> anyhow::Result<()> {
     let listener = TcpListener::bind((cli.host.as_str(), cli.port))?;
     let listener_fd = Fd(listener.as_raw_fd());
 
-    println!("listening {}", listener.local_addr()?);
+    info!("listening on {}", listener.local_addr()?);
 
     let mut server = UringServer::new(
         listener_fd,

@@ -283,7 +283,7 @@ impl<'a> UringCore<'a> {
             self.buffer_pool.return_to_pool(buf_index);
             self.token_alloc.remove(token_index);
             self.usi.queue_close(Fd(fd));
-            println!("invalid read - closing connection");
+            debug!("no data read from client - closing connection");
             return;
         }
 
@@ -307,8 +307,10 @@ impl<'a> UringCore<'a> {
                     });
                     if let Ok(path) = path_buffer {
                         let path = path.as_str();
+                        debug!("client requested path {}", path);
                         match self.file_system_handler.open_raw_ffd(path) {
                             Ok(result) => {
+                                debug!("file found - successful request");
                                 write_dynamic_ok_response(
                                     &mut response_header_buffer,
                                     path,
@@ -320,13 +322,16 @@ impl<'a> UringCore<'a> {
                                 if e.kind() == ErrorKind::NotFound
                                     || e.kind() == ErrorKind::IsADirectory =>
                             {
+                                debug!("file not found - unsuccessful request");
                                 write_static_content_not_found_error(&mut response_header_buffer);
                             }
-                            Err(_e) => {
+                            Err(e) => {
+                                error!("error opening path {} {:?}", path, e);
                                 write_static_internal_server_error(&mut response_header_buffer)
                             }
                         }
                     } else {
+                        debug!("client requested invalid path");
                         write_static_bad_request_error(&mut response_header_buffer);
                     };
                 }
@@ -389,13 +394,11 @@ impl<'a> UringCore<'a> {
                     }
                     remaining -= n as usize;
                 }
-                unsafe {
-                    libc::close(body.fd);
-                }
 
                 self.token_alloc.remove(token_index);
+                self.usi.queue_close(Fd(body.fd));
                 self.usi.queue_close(Fd(fd));
-                println!("closing connection");
+                debug!("closing connection");
             }
             WriteStrategy::SendFileInAsyncEventLoop => {
                 self.token_alloc[token_index] = Token::WriteBodySendFile {
@@ -451,7 +454,7 @@ impl<'a> UringCore<'a> {
             } else {
                 self.token_alloc.remove(token_index);
                 self.usi.queue_close(Fd(fd));
-                println!("closing connection");
+                debug!("closing connection");
             }
         } else {
             // Partial write — send the remainder.
@@ -473,6 +476,13 @@ impl<'a> UringCore<'a> {
         }
     }
 
+    fn close_body_and_connection(&mut self, fd: Fd, body_fd: Fd, token_index: usize) {
+        debug!("closing connection");
+        self.token_alloc.remove(token_index);
+        self.usi.queue_close(fd);
+        self.usi.queue_close(body_fd);
+    }
+
     fn handle_write_body_token(
         &mut self,
         fd: RawFd,
@@ -484,11 +494,7 @@ impl<'a> UringCore<'a> {
         let chunk_size = (len - offset as usize).min(self.body_write_chunk_size);
 
         if chunk_size <= 0 {
-            self.token_alloc.remove(token_index);
-            self.usi.queue_close(Fd(fd));
-            self.usi.queue_close(Fd(body_fd));
-
-            println!("closing connection");
+            self.close_body_and_connection(Fd(fd), Fd(body_fd), token_index);
             return;
         }
 
@@ -496,11 +502,7 @@ impl<'a> UringCore<'a> {
         let n = unsafe { libc::sendfile(fd, body_fd, &mut off, chunk_size) };
         let remaining = len as isize - n;
         if n <= 0 || remaining <= 0 {
-            self.token_alloc.remove(token_index);
-            self.usi.queue_close(Fd(fd));
-            self.usi.queue_close(Fd(body_fd));
-
-            println!("closing connection");
+            self.close_body_and_connection(Fd(fd), Fd(body_fd), token_index);
             return;
         }
 
@@ -621,7 +623,7 @@ impl<'a> UringCore<'a> {
             self.usi.queue_close(Fd(pipe_write));
             self.usi.queue_close(Fd(body_fd));
 
-            println!("closing connection");
+            debug!("closing client connection");
         }
     }
 
@@ -641,7 +643,7 @@ impl<'a> UringCore<'a> {
     }
 
     fn handle_accept_token(&mut self, ret: i32, token_index: usize, flags: u32) {
-        println!("connection accepted");
+        debug!("connection accepted");
 
         let fd = ret;
         let poll_token = self.token_alloc.insert(Token::Poll { fd });
@@ -659,7 +661,7 @@ impl<'a> UringCore<'a> {
         let error = io::Error::from_raw_os_error(-ret);
         let token = self.token_alloc.get(token_index);
 
-        eprintln!(
+        error!(
             "token {:?} error: {:?}",
             self.token_alloc.get(token_index),
             error
@@ -668,12 +670,13 @@ impl<'a> UringCore<'a> {
         match token {
             None => return,
             Some(Token::Accept) => {
+                debug!("rearming accept");
                 self.usi
                     .queue_multishot_accept(self.listener, token_index as _);
                 return;
             }
             Some(Token::WriteBodySendFile { fd, body_fd, .. }) => {
-                println!("send file fail - closing requested file fd");
+                error!("closing client connection");
                 self.usi.queue_close(Fd(*body_fd));
                 self.usi.queue_close(Fd(*fd));
             }
@@ -684,7 +687,7 @@ impl<'a> UringCore<'a> {
                 pipe_write,
                 ..
             }) => {
-                println!("closing connection");
+                error!("closing client connection");
                 self.usi.queue_close(Fd(*fd));
                 self.usi.queue_close(Fd(*pipe_read));
                 self.usi.queue_close(Fd(*pipe_write));
@@ -697,7 +700,7 @@ impl<'a> UringCore<'a> {
                 pipe_write,
                 ..
             }) => {
-                println!("closing connection");
+                error!("closing client connection");
                 self.usi.queue_close(Fd(*fd));
                 self.usi.queue_close(Fd(*pipe_read));
                 self.usi.queue_close(Fd(*pipe_write));
@@ -747,7 +750,7 @@ impl<'a> UringServer<'a> {
         self.core.prep_initial_accept();
 
         loop {
-            self.core.usi.submit_and_wait()?; // NOTE erroring here may leave fd's open leaking memory
+            self.core.usi.submit_and_wait()?; // NOTE ing here may leave fd's open
             self.cq.sync();
             self.core.usi.sync_sq_and_empty_backlog()?;
 
