@@ -1,8 +1,8 @@
 use crate::{
     buffer_pool::BufferPool, cli::Cli, file_system::FileSystemHandler, uring_server::UringServer,
 };
-use anyhow::Context;
-use io_uring::{IoUring, types::Fd};
+use anyhow::{Context, bail};
+use io_uring::{IoUring, Probe, opcode, types::Fd};
 use slab::Slab;
 use std::net::Ipv4Addr;
 
@@ -15,6 +15,8 @@ mod log;
 mod uring_server;
 
 fn main() -> anyhow::Result<()> {
+    check_feature_compatibility()?;
+
     let cli = Cli::parse();
 
     info!("starting server on {}:{}", &cli.bind, cli.port);
@@ -28,7 +30,7 @@ fn main() -> anyhow::Result<()> {
                 let listener = make_tcp_listener(&cli.bind, cli.port, cli.backlog)?;
                 let file_system_handler = FileSystemHandler::new(&cli.dir)?;
                 let token_alloc = Slab::with_capacity(64);
-                let mut buffer_pool = BufferPool::new(64);
+                let mut buffer_pool = BufferPool::with_capacity(64);
                 buffer_pool.allocate_range(64);
                 let mut ring = IoUring::new(cli.uring_entries)?;
 
@@ -55,6 +57,21 @@ fn main() -> anyhow::Result<()> {
         }
     }
 
+    Ok(())
+}
+
+fn check_feature_compatibility() -> anyhow::Result<()> {
+    let probe = Probe::new();
+    // most recent feature
+    if !probe.is_supported(opcode::AcceptMulti::CODE) {
+        bail!(
+            "iobeam uses the AcceptMulti opcode\
+            which was introduced in kernel 5.19\n\
+            Please use a kernel >=5.19\
+            and ensure 'sysctl kernel.io_uring_disabled' != 2 "
+                .to_string()
+        )
+    }
     Ok(())
 }
 

@@ -8,7 +8,7 @@ pub struct BufferPool {
 }
 
 impl BufferPool {
-    pub fn new(inital_capacity: usize) -> Self {
+    pub fn with_capacity(inital_capacity: usize) -> Self {
         Self {
             pool: Vec::with_capacity(inital_capacity),
             alloc: Slab::with_capacity(inital_capacity),
