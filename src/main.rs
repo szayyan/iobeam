@@ -61,13 +61,15 @@ fn main() -> anyhow::Result<()> {
 }
 
 fn check_feature_compatibility() -> anyhow::Result<()> {
-    let probe = Probe::new();
+    let temp_ring = IoUring::new(1)?;
+    let mut probe = Probe::new();
+    temp_ring.submitter().register_probe(&mut probe)?;
     // most recent feature
     if !probe.is_supported(opcode::AcceptMulti::CODE) {
         bail!(
             "iobeam uses the AcceptMulti opcode\
             which was introduced in kernel 5.19\n\
-            Please use a kernel >=5.19\
+            Please use a kernel >=5.19 \
             and ensure 'sysctl kernel.io_uring_disabled' != 2 "
                 .to_string()
         )
