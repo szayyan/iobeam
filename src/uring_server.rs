@@ -396,10 +396,13 @@ impl<'a> UringCore<'a> {
                     remaining -= n as usize;
                 }
 
-                self.token_alloc.remove(token_index);
+                // TODO: reuse buffer directly instead of removing + pushing
+                // will need to pass buf_index but must be valid
+                // self.token_alloc.remove(token_index);
                 self.usi.queue_close(Fd(body.fd));
-                self.usi.queue_close(Fd(fd));
-                debug!("closing connection");
+                self.handle_poll_token(fd, token_index); // reuse token
+                // self.usi.queue_close(Fd(fd));
+                // debug!("closing connection");
             }
             WriteStrategy::SendFileInAsyncEventLoop => {
                 self.token_alloc[token_index] = Token::WriteBodySendFile {
@@ -449,6 +452,7 @@ impl<'a> UringCore<'a> {
         let write_complete = offset + write_len >= len;
 
         if write_complete {
+            // TODO: reuse connection instead of close
             self.buffer_pool.return_to_pool(buf_index);
             if let Some(body) = body {
                 self.begin_write_body(token_index, fd, body);
@@ -477,11 +481,12 @@ impl<'a> UringCore<'a> {
         }
     }
 
-    fn close_body_and_connection(&mut self, fd: Fd, body_fd: Fd, token_index: usize) {
+    fn close_body_and_connection(&mut self, fd: RawFd, body_fd: Fd, token_index: usize) {
         debug!("closing connection");
-        self.token_alloc.remove(token_index);
-        self.usi.queue_close(fd);
+        // self.token_alloc.remove(token_index);
+        // self.usi.queue_close(fd);
         self.usi.queue_close(body_fd);
+        self.handle_poll_token(fd, token_index);
     }
 
     fn handle_write_body_token(
@@ -495,7 +500,7 @@ impl<'a> UringCore<'a> {
         let chunk_size = (len - offset as usize).min(self.body_write_chunk_size);
 
         if chunk_size <= 0 {
-            self.close_body_and_connection(Fd(fd), Fd(body_fd), token_index);
+            self.close_body_and_connection(fd, Fd(body_fd), token_index);
             return;
         }
 
@@ -503,7 +508,7 @@ impl<'a> UringCore<'a> {
         let n = unsafe { libc::sendfile(fd, body_fd, &mut off, chunk_size) };
         let remaining = len as isize - n;
         if n <= 0 || remaining <= 0 {
-            self.close_body_and_connection(Fd(fd), Fd(body_fd), token_index);
+            self.close_body_and_connection(fd, Fd(body_fd), token_index);
             return;
         }
 
@@ -618,11 +623,13 @@ impl<'a> UringCore<'a> {
             );
         } else {
             // All data sent — close pipe fds and the file fd, then close the socket.
-            self.token_alloc.remove(token_index);
-            self.usi.queue_close(Fd(fd));
+            // self.token_alloc.remove(token_index);
+            // self.usi.queue_close(Fd(fd));
             self.usi.queue_close(Fd(pipe_read));
             self.usi.queue_close(Fd(pipe_write));
             self.usi.queue_close(Fd(body_fd));
+
+            self.handle_poll_token(fd, token_index);
 
             debug!("closing client connection");
         }
@@ -792,6 +799,7 @@ pub enum Token {
         len: usize,
         body: Option<FileResult>,
     },
+    // todo: investigate why so slow? noop related?
     WriteBodySendFile {
         fd: RawFd,
         body_fd: RawFd,
