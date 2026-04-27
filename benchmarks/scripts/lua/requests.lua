@@ -114,10 +114,32 @@ local urls = {
     "/med/file_07.bin"
 }
 
+function init(args)
+    if #args == 0 then return end
+
+    local filter = { small = false, med = false, large = false }
+
+    for _, arg in ipairs(args) do
+        if filter[arg] == nil then
+            error("Invalid category '" .. arg .. "'. Valid categories: small, med, large")
+        end
+        filter[arg] = true
+    end
+
+    local i = 1
+    while i <= #urls do
+        local category = urls[i]:match("^/([^/]+)/")
+        if not filter[category] then
+            table.remove(urls, i)
+        else
+            i = i + 1
+        end
+    end
+end
+
 local i = 0
 
 request = function()
     i = (i % #urls) + 1
-    wrk.path = urls[i]
-    return wrk.format("GET")
+    return wrk.format("GET", urls[i] )
 end
