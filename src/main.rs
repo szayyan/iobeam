@@ -29,9 +29,9 @@ fn main() -> anyhow::Result<()> {
                 // bc its unncessary. a benign fd leak
                 let listener = make_tcp_listener(&cli.bind, cli.port, cli.backlog)?;
                 let file_system_handler = FileSystemHandler::new(&cli.dir)?;
-                let token_alloc = Slab::with_capacity(64);
-                let mut buffer_pool = BufferPool::with_capacity(64);
-                buffer_pool.allocate_range(64);
+                let token_alloc = Slab::with_capacity(1024);
+                let mut buffer_pool = BufferPool::with_capacity(1024);
+                buffer_pool.allocate_range(1024);
                 let mut ring = IoUring::new(cli.uring_entries)?;
 
                 let mut server = UringServer::new(

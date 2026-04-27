@@ -1,3 +1,12 @@
+use crate::{
+    buffer_pool::{BUFFER_POOL_ITEM_SIZE, BufferPool},
+    file_system::{FileResult, FileSystemHandler},
+    http::{
+        HttpHeaderBuffer, decode_http_request_path, is_get_request, write_dynamic_ok_response,
+        write_static_bad_request_error, write_static_content_not_found_error,
+        write_static_content_too_large_error, write_static_internal_server_error,
+    },
+};
 use io_uring::{
     CompletionQueue, IoUring, SubmissionQueue, Submitter, cqueue, opcode, squeue::Entry, types::Fd,
 };
@@ -7,16 +16,6 @@ use std::{
     io::{self, ErrorKind},
     os::fd::RawFd,
     path::Path,
-};
-
-use crate::{
-    buffer_pool::{BUFFER_POOL_ITEM_SIZE, BufferPool},
-    file_system::{FileResult, FileSystemHandler},
-    http::{
-        HttpHeaderBuffer, decode_http_request_path, is_get_request, write_dynamic_ok_response,
-        write_static_bad_request_error, write_static_content_not_found_error,
-        write_static_content_too_large_error, write_static_internal_server_error,
-    },
 };
 
 #[derive(Copy, Clone, clap::ValueEnum)]
