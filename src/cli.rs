@@ -25,7 +25,7 @@ pub struct Cli {
     pub body_write_chunk_size: usize,
 
     /// Strategy used to write the response body
-    #[arg(long, default_value = "pipe-and-splice")]
+    #[arg(long, default_value = "send-file-in-async-event-loop")]
     pub write_strategy: WriteStrategy,
 
     /// TCP listener backlog

@@ -480,12 +480,15 @@ impl<'a> UringCore<'a> {
         }
     }
 
-    fn close_body_and_connection(&mut self, fd: RawFd, body_fd: Fd, token_index: usize) {
-        debug!("closing connection");
-        // self.token_alloc.remove(token_index);
-        // self.usi.queue_close(fd);
+    fn close_body_and_recv_next(&mut self, fd: RawFd, body_fd: Fd, token_index: usize) {
         self.usi.queue_close(body_fd);
         self.handle_poll_token(fd, token_index);
+    }
+
+    fn close_body_and_connection(&mut self, fd: RawFd, body_fd: Fd, token_index: usize) {
+        self.token_alloc.remove(token_index);
+        self.usi.queue_close(body_fd);
+        self.usi.queue_close(Fd(fd));
     }
 
     fn handle_write_body_token(
@@ -499,15 +502,18 @@ impl<'a> UringCore<'a> {
         let chunk_size = (len - offset as usize).min(self.body_write_chunk_size);
 
         if chunk_size <= 0 {
-            self.close_body_and_connection(fd, Fd(body_fd), token_index);
+            self.close_body_and_recv_next(fd, Fd(body_fd), token_index);
             return;
         }
 
         let mut off: libc::off_t = offset;
         let n = unsafe { libc::sendfile(fd, body_fd, &mut off, chunk_size) };
         let remaining = len as isize - n;
-        if n <= 0 || remaining <= 0 {
+        if n <= 0 {
             self.close_body_and_connection(fd, Fd(body_fd), token_index);
+            return;
+        } else if remaining <= 0 {
+            self.close_body_and_recv_next(fd, Fd(body_fd), token_index);
             return;
         }
 
