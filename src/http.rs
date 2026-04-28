@@ -59,10 +59,7 @@ pub fn is_get_request(request: &httparse::Request) -> bool {
 }
 
 fn write_static_response_header(buf: &mut HttpHeaderBuffer, response: &[u8]) {
-    assert!(RESPONSE_HEADER_BUFFER_SIZE > response.len());
-    unsafe {
-        buf.try_extend_from_slice(response).unwrap_unchecked();
-    }
+    buf.try_extend_from_slice(response).expect("Attempted to write static header response greater than the size of the response header buffer");
 }
 
 pub fn decode_http_request_path(path: &str) -> anyhow::Result<Cow<'_, str>> {
