@@ -805,7 +805,6 @@ pub enum Token {
         len: usize,
         body: Option<FileResult>,
     },
-    // todo: investigate why so slow? noop related?
     WriteBodySendFile {
         fd: RawFd,
         body_fd: RawFd,
