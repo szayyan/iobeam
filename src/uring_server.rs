@@ -516,7 +516,8 @@ impl<'a> UringCore<'a> {
             body_fd,
             offset: off,
             len: remaining as _,
-        }
+        };
+        self.usi.queue_noop(token_index as _);
     }
 
     fn handle_splice_file_to_pipe_token(
