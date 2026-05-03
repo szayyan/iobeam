@@ -2,9 +2,11 @@ use crate::{
     buffer_pool::{BUFFER_POOL_ITEM_SIZE, BufferPool},
     file_system::{FileResult, FileSystemHandler},
     http::{
-        HttpHeaderBuffer, decode_http_request_path, is_get_request, write_dynamic_ok_response,
+        ByteRange, HttpHeaderBuffer, decode_http_request_path, is_get_request,
+        parse_range_header, write_dynamic_ok_response, write_dynamic_partial_content_response,
         write_static_bad_request_error, write_static_content_not_found_error,
         write_static_content_too_large_error, write_static_internal_server_error,
+        write_static_range_not_satisfiable_error,
     },
 };
 use io_uring::{
@@ -223,8 +225,9 @@ impl<'a> UringCore<'a> {
                 offset,
                 len,
                 body,
+                body_range,
             } => {
-                self.handle_write_headers_token(fd, buf_index, offset, len, body, ret, token_index)
+                self.handle_write_headers_token(fd, buf_index, offset, len, body, body_range, ret, token_index)
             }
             Token::WriteBodySendFile {
                 fd,
@@ -294,6 +297,7 @@ impl<'a> UringCore<'a> {
 
         let mut response_header_buffer = HttpHeaderBuffer::new();
         let mut response_body: Option<FileResult> = None;
+        let mut body_range: Option<(usize, usize)> = None;
 
         match result {
             Ok(httparse::Status::Complete(_)) => {
@@ -311,12 +315,40 @@ impl<'a> UringCore<'a> {
                         match self.file_system_handler.open_raw_ffd(path) {
                             Ok(result) => {
                                 debug!("file found - successful request");
-                                write_dynamic_ok_response(
-                                    &mut response_header_buffer,
-                                    path,
-                                    result.size,
-                                );
-                                response_body = Some(result)
+                                let range_header = request
+                                    .headers
+                                    .iter()
+                                    .find(|h| h.name.eq_ignore_ascii_case("range"))
+                                    .and_then(|h| std::str::from_utf8(h.value).ok());
+                                if let Some(range_str) = range_header {
+                                    match parse_range_header(range_str, result.size) {
+                                        ByteRange::Partial { offset, length } => {
+                                            write_dynamic_partial_content_response(
+                                                &mut response_header_buffer,
+                                                path,
+                                                offset,
+                                                length,
+                                                result.size,
+                                            );
+                                            body_range = Some((offset, length));
+                                            response_body = Some(result);
+                                        }
+                                        ByteRange::Unsatisfiable => {
+                                            write_static_range_not_satisfiable_error(
+                                                &mut response_header_buffer,
+                                                result.size,
+                                            );
+                                            self.usi.queue_close(Fd(result.fd));
+                                        }
+                                    }
+                                } else {
+                                    write_dynamic_ok_response(
+                                        &mut response_header_buffer,
+                                        path,
+                                        result.size,
+                                    );
+                                    response_body = Some(result);
+                                }
                             }
                             Err(e)
                                 if e.kind() == ErrorKind::NotFound
@@ -369,17 +401,25 @@ impl<'a> UringCore<'a> {
             offset: 0,
             len: header_len,
             body: response_body,
+            body_range,
         };
 
         self.usi
             .queue_send(Fd(fd), buf.as_ptr(), header_len, token_index as _);
     }
 
-    fn begin_write_body(&mut self, token_index: usize, fd: RawFd, body: FileResult) {
+    fn begin_write_body(
+        &mut self,
+        token_index: usize,
+        fd: RawFd,
+        body: FileResult,
+        range: Option<(usize, usize)>,
+    ) {
+        let (send_offset, send_length) = range.unwrap_or((0, body.size));
         match self.write_strategy {
             WriteStrategy::SendFile => {
-                let mut off: libc::off_t = 0;
-                let mut remaining = body.size;
+                let mut off: libc::off_t = send_offset as _;
+                let mut remaining = send_length;
                 while remaining > 0 {
                     let n = unsafe {
                         libc::sendfile(
@@ -407,26 +447,26 @@ impl<'a> UringCore<'a> {
                 self.token_alloc[token_index] = Token::WriteBodySendFile {
                     fd,
                     body_fd: body.fd,
-                    offset: 0,
-                    len: body.size,
+                    offset: send_offset as _,
+                    len: send_length,
                 };
                 self.usi.queue_noop(token_index as _);
             }
             WriteStrategy::PipeAndSplice => {
                 let mut pipe_fds = [-1i32; 2];
                 unsafe { libc::pipe2(pipe_fds.as_mut_ptr(), libc::O_CLOEXEC) };
-                let chunk = body.size.min(self.body_write_chunk_size) as u32;
+                let chunk = send_length.min(self.body_write_chunk_size) as u32;
                 self.token_alloc[token_index] = Token::WriteBodySpliceFileToPipe {
                     fd,
                     body_fd: body.fd,
                     pipe_read: pipe_fds[0],
                     pipe_write: pipe_fds[1],
-                    file_offset: 0,
-                    remaining: body.size,
+                    file_offset: send_offset as _,
+                    remaining: send_length,
                 };
                 self.usi.queue_splice(
                     Fd(body.fd),
-                    0,
+                    send_offset as i64,
                     Fd(pipe_fds[1]),
                     -1,
                     chunk,
@@ -444,6 +484,7 @@ impl<'a> UringCore<'a> {
         offset: usize,
         len: usize,
         body: Option<FileResult>,
+        body_range: Option<(usize, usize)>,
         ret: i32,
         token_index: usize,
     ) {
@@ -454,7 +495,7 @@ impl<'a> UringCore<'a> {
             // TODO: reuse connection instead of close
             self.buffer_pool.return_to_pool(buf_index);
             if let Some(body) = body {
-                self.begin_write_body(token_index, fd, body);
+                self.begin_write_body(token_index, fd, body, body_range);
             } else {
                 self.token_alloc.remove(token_index);
                 self.usi.queue_close(Fd(fd));
@@ -473,6 +514,7 @@ impl<'a> UringCore<'a> {
                 offset,
                 len,
                 body,
+                body_range,
             };
 
             self.usi
@@ -499,20 +541,23 @@ impl<'a> UringCore<'a> {
         len: usize,
         token_index: usize,
     ) {
-        let chunk_size = (len - offset as usize).min(self.body_write_chunk_size);
+        // `len` is remaining bytes to send; `offset` is the current file position.
+        let chunk_size = len.min(self.body_write_chunk_size);
 
-        if chunk_size <= 0 {
+        if chunk_size == 0 {
             self.close_body_and_recv_next(fd, Fd(body_fd), token_index);
             return;
         }
 
         let mut off: libc::off_t = offset;
         let n = unsafe { libc::sendfile(fd, body_fd, &mut off, chunk_size) };
-        let remaining = len as isize - n;
         if n <= 0 {
             self.close_body_and_connection(fd, Fd(body_fd), token_index);
             return;
-        } else if remaining <= 0 {
+        }
+
+        let remaining = len - n as usize;
+        if remaining == 0 {
             self.close_body_and_recv_next(fd, Fd(body_fd), token_index);
             return;
         }
@@ -521,7 +566,7 @@ impl<'a> UringCore<'a> {
             fd,
             body_fd,
             offset: off,
-            len: remaining as _,
+            len: remaining,
         };
         self.usi.queue_noop(token_index as _);
     }
@@ -804,6 +849,7 @@ pub enum Token {
         offset: usize,
         len: usize,
         body: Option<FileResult>,
+        body_range: Option<(usize, usize)>,
     },
     WriteBodySendFile {
         fd: RawFd,

@@ -66,3 +66,104 @@ pub fn decode_http_request_path(path: &str) -> anyhow::Result<Cow<'_, str>> {
     let path = path.trim_start_matches('/');
     Ok(percent_decode_str(path).decode_utf8()?)
 }
+
+pub enum ByteRange {
+    Partial { offset: usize, length: usize },
+    Unsatisfiable,
+}
+
+pub fn parse_range_header(value: &str, file_size: usize) -> ByteRange {
+    let Some(value) = value.trim().strip_prefix("bytes=") else {
+        return ByteRange::Unsatisfiable;
+    };
+
+    if value.contains(',') {
+        return ByteRange::Unsatisfiable;
+    }
+
+    let Some((start_str, end_str)) = value.split_once('-') else {
+        return ByteRange::Unsatisfiable;
+    };
+
+    let (offset, end_inclusive) = if start_str.is_empty() {
+        // suffix-length form: bytes=-N (last N bytes)
+        let Ok(suffix_len) = end_str.trim().parse::<usize>() else {
+            return ByteRange::Unsatisfiable;
+        };
+        if suffix_len == 0 {
+            return ByteRange::Unsatisfiable;
+        }
+        (file_size.saturating_sub(suffix_len), file_size - 1)
+    } else {
+        let Ok(start) = start_str.trim().parse::<usize>() else {
+            return ByteRange::Unsatisfiable;
+        };
+        let end = if end_str.trim().is_empty() {
+            file_size - 1
+        } else {
+            let Ok(end) = end_str.trim().parse::<usize>() else {
+                return ByteRange::Unsatisfiable;
+            };
+            end
+        };
+        (start, end)
+    };
+
+    if offset >= file_size {
+        return ByteRange::Unsatisfiable;
+    }
+
+    let end_inclusive = end_inclusive.min(file_size - 1);
+    if offset > end_inclusive {
+        return ByteRange::Unsatisfiable;
+    }
+
+    ByteRange::Partial {
+        offset,
+        length: end_inclusive - offset + 1,
+    }
+}
+
+pub fn write_dynamic_partial_content_response(
+    buf: &mut HttpHeaderBuffer,
+    path: &str,
+    offset: usize,
+    length: usize,
+    file_size: usize,
+) {
+    let content_type = path
+        .rfind('.')
+        .map(|s| mime_guess::from_ext(&path[s + 1..]).first_raw())
+        .flatten()
+        .unwrap_or("application/octet-stream");
+
+    let mut n_buf = itoa::Buffer::new();
+
+    buf.try_extend_from_slice(b"HTTP/1.1 206 Partial Content\r\nContent-Type: ")
+        .unwrap();
+    buf.try_extend_from_slice(content_type.as_bytes()).unwrap();
+    buf.try_extend_from_slice(b"\r\nContent-Length: ").unwrap();
+    buf.try_extend_from_slice(n_buf.format(length).as_bytes())
+        .unwrap();
+    buf.try_extend_from_slice(b"\r\nContent-Range: bytes ")
+        .unwrap();
+    buf.try_extend_from_slice(n_buf.format(offset).as_bytes())
+        .unwrap();
+    buf.try_extend_from_slice(b"-").unwrap();
+    buf.try_extend_from_slice(n_buf.format(offset + length - 1).as_bytes())
+        .unwrap();
+    buf.try_extend_from_slice(b"/").unwrap();
+    buf.try_extend_from_slice(n_buf.format(file_size).as_bytes())
+        .unwrap();
+    buf.try_extend_from_slice(b"\r\n\r\n").unwrap();
+}
+
+pub fn write_static_range_not_satisfiable_error(buf: &mut HttpHeaderBuffer, file_size: usize) {
+    let mut n_buf = itoa::Buffer::new();
+    buf.try_extend_from_slice(b"HTTP/1.1 416 Range Not Satisfiable\r\nContent-Range: bytes */")
+        .unwrap();
+    buf.try_extend_from_slice(n_buf.format(file_size).as_bytes())
+        .unwrap();
+    buf.try_extend_from_slice(b"\r\nContent-Length: 0\r\n\r\n")
+        .unwrap();
+}
