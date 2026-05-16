@@ -2,8 +2,8 @@ use crate::{
     buffer_pool::{BUFFER_POOL_ITEM_SIZE, BufferPool},
     file_system::{FileResult, FileSystemHandler},
     http::{
-        ByteRange, HttpHeaderBuffer, decode_http_request_path, is_get_request,
-        parse_range_header, write_dynamic_ok_response, write_dynamic_partial_content_response,
+        ByteRange, HttpHeaderBuffer, decode_http_request_path, is_get_request, parse_range_header,
+        write_dynamic_ok_response, write_dynamic_partial_content_response,
         write_static_bad_request_error, write_static_content_not_found_error,
         write_static_content_too_large_error, write_static_internal_server_error,
         write_static_range_not_satisfiable_error,
@@ -226,9 +226,16 @@ impl<'a> UringCore<'a> {
                 len,
                 body,
                 body_range,
-            } => {
-                self.handle_write_headers_token(fd, buf_index, offset, len, body, body_range, ret, token_index)
-            }
+            } => self.handle_write_headers_token(
+                fd,
+                buf_index,
+                offset,
+                len,
+                body,
+                body_range,
+                ret,
+                token_index,
+            ),
             Token::WriteBodySendFile {
                 fd,
                 body_fd,
@@ -299,6 +306,7 @@ impl<'a> UringCore<'a> {
         let mut response_body: Option<FileResult> = None;
         let mut body_range: Option<(usize, usize)> = None;
 
+        // TODO: refact0r this - nested too deeply
         match result {
             Ok(httparse::Status::Complete(_)) => {
                 if !is_get_request(&request) {
@@ -315,6 +323,7 @@ impl<'a> UringCore<'a> {
                         match self.file_system_handler.open_raw_ffd(path) {
                             Ok(result) => {
                                 debug!("file found - successful request");
+                                // TODO: investigate how can we make this more performant instead of linear scan.
                                 let range_header = request
                                     .headers
                                     .iter()
@@ -437,11 +446,8 @@ impl<'a> UringCore<'a> {
 
                 // TODO: reuse buffer directly instead of removing + pushing
                 // will need to pass buf_index but must be valid
-                // self.token_alloc.remove(token_index);
                 self.usi.queue_close(Fd(body.fd));
                 self.handle_poll_token(fd, token_index); // reuse token
-                // self.usi.queue_close(Fd(fd));
-                // debug!("closing connection");
             }
             WriteStrategy::SendFileInAsyncEventLoop => {
                 self.token_alloc[token_index] = Token::WriteBodySendFile {
@@ -674,15 +680,14 @@ impl<'a> UringCore<'a> {
             );
         } else {
             // All data sent — close pipe fds and the file fd, then close the socket.
-            // self.token_alloc.remove(token_index);
-            // self.usi.queue_close(Fd(fd));
+            //
+
+            // TODO: add queue_close_multi for better perf
             self.usi.queue_close(Fd(pipe_read));
             self.usi.queue_close(Fd(pipe_write));
             self.usi.queue_close(Fd(body_fd));
 
             self.handle_poll_token(fd, token_index);
-
-            debug!("closing client connection");
         }
     }
 
